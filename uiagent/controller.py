@@ -9,10 +9,21 @@
 
 坐标系：全部为屏幕绝对物理像素，前提是调用方已执行
 :func:`uiagent.dpi.enable_dpi_awareness`。
+
+P0（应用唤起与定位优化方案 改动点 #1/#2）
+----------------------------------------
+- ``locate`` / ``locate_many`` 新增 ``scope`` / ``hwnd`` / ``app`` / ``reuse_ttl`` 参数，
+  窗口限定默认启用（``scope`` 缺省 ``auto``）；旧调用不传新参数时行为按
+  ``UIAGENT_SCOPE_DEFAULT`` 决定，默认值 ``auto`` 在无任何窗口线索时保持桌面级搜索，
+  **旧调用语义不变**。
+- 新增 ``AppContext`` TTL 缓存（``UIAGENT_CTX_TTL``，默认 30 s；设 0 关闭），
+  缓存 ``app → {hwnd, bounds, state}``，供定位复用已确定的目标窗口。
+- 回退开关：``UIAGENT_SCOPE_DEFAULT=desktop`` 一键恢复旧语义。
 """
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,8 +56,21 @@ def _emit_locate(
     ocr_ms: float = 0.0,
     candidates_count: int = 0,
     multi: bool = False,
+    scope: str = "desktop",
+    scope_hwnd: int = 0,
+    cached: bool = False,
+    locate_ms: Optional[float] = None,
+    state: str = "",
+    ensure_ms: Optional[float] = None,
+    launch_ms: Optional[float] = None,
+    degraded_reason: str = "",
 ) -> None:
-    """落 ``locate`` 审计事件（只读，不改变 ``LocateResult`` 与工具返回结构）。"""
+    """落 ``locate`` 审计事件（只读，不改变 ``LocateResult`` 与工具返回结构）。
+
+    P0（改动点 #5）新增字段：``scope`` / ``scope_hwnd`` / ``cached`` / ``locate_ms`` /
+    ``state`` / ``degraded_reason``；``ensure_ms`` / ``launch_ms`` 仅在由
+    ``ui_click(app=...)`` 的一次调用合并链路触发时携带。
+    """
     audit = get_audit_logger()
     if audit is None:
         return
@@ -63,7 +87,24 @@ def _emit_locate(
         "uia_ms": round(float(uia_ms), 3),
         "ocr_ms": round(float(ocr_ms), 3),
         "candidates_count": int(candidates_count),
+        # ---- P0 新增（均为新增列，不参与旧口径计算）
+        "scope": scope or "desktop",
+        "scope_hwnd": int(scope_hwnd or 0),
+        "cached": bool(cached),
+        "locate_ms": round(float(locate_ms if locate_ms is not None else (uia_ms + ocr_ms)), 3),
     }
+    if result.state:
+        payload["state"] = result.state
+    elif state:
+        payload["state"] = state
+    if result.degraded:
+        payload["degraded"] = bool(result.degraded)
+    if degraded_reason:
+        payload["degraded_reason"] = degraded_reason
+    if ensure_ms is not None:
+        payload["ensure_ms"] = round(float(ensure_ms), 3)
+    if launch_ms is not None:
+        payload["launch_ms"] = round(float(launch_ms), 3)
     if multi:
         payload["multi"] = True
     element = result.element
@@ -105,6 +146,149 @@ def _element_snapshot(element: Optional[UIElement]) -> Optional[Dict[str, Any]]:
     }
 
 
+# ---------------------------------------------------------------- P0：scope 工程
+_SCOPE_MODES = ("auto", "window", "desktop")
+
+#: ``AppContextEntry`` 允许的状态（P0 只区分"窗口就绪"与"未就绪"，P1 扩展为 S1~S4）
+_CTX_STATES = ("ready", "unknown")
+
+
+def _scope_default() -> str:
+    """定位默认搜索域：``UIAGENT_SCOPE_DEFAULT=desktop`` 可一键恢复旧语义。"""
+    value = str(os.environ.get("UIAGENT_SCOPE_DEFAULT", "auto") or "auto").strip().lower()
+    return value if value in _SCOPE_MODES else "auto"
+
+
+def _context_ttl() -> float:
+    """``AppContext`` 缓存 TTL（秒）；``UIAGENT_CTX_TTL=0`` 关闭缓存。"""
+    raw = str(os.environ.get("UIAGENT_CTX_TTL", "30") or "30").strip()
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 30.0
+
+
+@dataclass
+class AppContextEntry:
+    """``app → {hwnd, bounds, state}`` 缓存条目（只读快照，不含任何控件句柄）。"""
+
+    app: str
+    hwnd: int
+    bounds: Optional[Tuple[int, int, int, int]] = None
+    title: str = ""
+    process_name: str = ""
+    state: str = "unknown"
+    cached_at: float = field(default_factory=time.time)
+
+    def age(self) -> float:
+        return max(0.0, time.time() - float(self.cached_at))
+
+    def expired(self, ttl: float) -> bool:
+        return ttl <= 0 or self.age() > float(ttl)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "app": self.app,
+            "hwnd": int(self.hwnd),
+            "bounds": list(self.bounds) if self.bounds else None,
+            "title": self.title,
+            "process_name": self.process_name,
+            "state": self.state,
+            "age_ms": round(self.age() * 1000.0, 1),
+        }
+
+
+class AppContext:
+    """``app`` 级别的轻量 TTL 缓存（P0 改动点 #2）。
+
+    只缓存"应用 → 当前可用窗口"这一条信息，供后续定位复用，避免每次定位都退化为
+    桌面级全树搜索。命中后仍由调用方校验 hwnd 是否仍然有效，失效即自动清除。
+
+    - ``UIAGENT_CTX_TTL=0`` → 完全关闭（不读不写）；
+    - 仅在 ``scope=auto`` 时参与决策，显式 ``scope`` 永不读缓存。
+    """
+
+    def __init__(self, ttl: Optional[float] = None) -> None:
+        self.ttl = _context_ttl() if ttl is None else max(0.0, float(ttl))
+        self._items: Dict[str, AppContextEntry] = {}
+        self.hits = 0
+        self.misses = 0
+
+    # ------------------------------------------------------------ 基础访问
+    @staticmethod
+    def _key(app: Any) -> str:
+        return str(app or "").strip().lower()
+
+    @property
+    def enabled(self) -> bool:
+        return self.ttl > 0
+
+    def get(self, app: Any = None, window: Any = None, hwnd: Optional[int] = None) -> Optional[AppContextEntry]:
+        """取缓存条目；传入 ``window`` / ``hwnd`` 时要求与缓存 hwnd 一致。"""
+        if not self.enabled:
+            return None
+        key = self._key(app)
+        if not key:
+            return None
+        entry = self._items.get(key)
+        if entry is None:
+            self.misses += 1
+            return None
+        if entry.expired(self.ttl):
+            self._items.pop(key, None)
+            self.misses += 1
+            return None
+        if hwnd and int(hwnd) != int(entry.hwnd):
+            self.misses += 1
+            return None
+        self.hits += 1
+        return entry
+
+    def set(
+        self,
+        app: Any,
+        hwnd: int,
+        bounds: Any = None,
+        title: str = "",
+        process_name: str = "",
+        state: str = "ready",
+    ) -> Optional[AppContextEntry]:
+        """写入缓存条目；``app`` 为空或缓存关闭时不写。"""
+        if not self.enabled:
+            return None
+        key = self._key(app)
+        if not key or not hwnd:
+            return None
+        entry = AppContextEntry(
+            app=str(app).strip(),
+            hwnd=int(hwnd),
+            bounds=tuple(int(v) for v in bounds) if bounds else None,
+            title=str(title or ""),
+            process_name=str(process_name or ""),
+            state=state if state in _CTX_STATES else "unknown",
+        )
+        self._items[key] = entry
+        return entry
+
+    def invalidate(self, app: Any = None) -> None:
+        """清除指定应用（``app`` 为空时清空全部）缓存。"""
+        if app is None:
+            self._items.clear()
+            return
+        self._items.pop(self._key(app), None)
+
+    def stats(self) -> Dict[str, Any]:
+        total = self.hits + self.misses
+        return {
+            "enabled": self.enabled,
+            "ttl": self.ttl,
+            "size": len(self._items),
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": round(self.hits / total, 4) if total else 0.0,
+        }
+
+
 @dataclass
 class LocateResult:
     """目标定位结果（只描述"在哪"，不产生任何副作用）。"""
@@ -122,6 +306,21 @@ class LocateResult:
     hit_window: Optional[Dict[str, Any]] = None
     #: 是否为了命中目标窗口而临时抬升过 Z 序（被上层/置顶窗口遮挡时）
     auto_raise: bool = False
+    # ---- P0（改动点 #1）：定位搜索域与耗时归因
+    #: 本次定位实际使用的搜索域："window" | "desktop"
+    scope: str = "desktop"
+    #: 窗口限定所用的 hwnd（desktop 域为 0）
+    scope_hwnd: int = 0
+    #: scope 是否来自 ``AppContext`` 缓存命中
+    cached: bool = False
+    #: 定位段耗时（uia_ms + ocr_ms）
+    locate_ms: float = 0.0
+    #: 应用状态（P1 起为 S1~S4；P0 由 ensure/缓存回填，可为空）
+    state: str = ""
+    #: 是否降级返回（如窗口线索解析失败而退化为桌面级）
+    degraded: bool = False
+    #: 降级原因（见 ``uiagent.audit.DEGRADED_REASONS``）
+    degraded_reason: str = ""
 
     @property
     def center(self) -> Tuple[int, int]:
@@ -145,6 +344,17 @@ class LocateResult:
             data["hit_window"] = self.hit_window
         if self.auto_raise:
             data["auto_raise"] = True
+        # ---- P0（改动点 #1/#5）：只增字段，不删既有字段
+        data["scope"] = self.scope
+        data["scope_hwnd"] = int(self.scope_hwnd)
+        data["cached"] = bool(self.cached)
+        data["locate_ms"] = round(float(self.locate_ms), 3)
+        if self.state:
+            data["state"] = self.state
+        if self.degraded:
+            data["degraded"] = True
+        if self.degraded_reason:
+            data["degraded_reason"] = self.degraded_reason
         return data
 
 
@@ -169,6 +379,8 @@ class UniversalController:
         self._mouse = None
         self._keyboard = None
         self._clipboard = None
+        # P0（改动点 #2）：app → 目标窗口的 TTL 缓存，供定位复用
+        self._ctx = AppContext()
 
     # ============================================================ 惰性组件
     @property
@@ -413,16 +625,91 @@ class UniversalController:
         role: Optional[str] = None,
         fuzzy: bool = True,
         region: Optional[Rect] = None,
+        scope: Optional[str] = None,
+        hwnd: Optional[int] = None,
+        app: Any = None,
+        reuse_ttl: Optional[float] = None,
+        state: str = "",
+        ensure_ms: Optional[float] = None,
+        launch_ms: Optional[float] = None,
     ) -> LocateResult:
         """定位目标（只查询坐标，不执行点击）。
 
         :param target: 元素名称 / 界面文字
         :param use_ocr_fallback: UIA 未命中时是否启用 OCR 兜底
-        :param window: 限定搜索窗口（UIElement 或原生控件）；None 表示整个桌面
+        :param window: 限定搜索窗口（UIElement 或原生控件）
         :param role: 限定元素角色（如 "Button"）
+        :param scope: 搜索域。缺省 ``None`` 时取 ``UIAGENT_SCOPE_DEFAULT``（默认 ``auto``）：
+
+            - ``auto``：有 ``hwnd`` / ``window`` 线索或 ``AppContext`` 缓存命中 → 窗口限定；
+              都没有 → 桌面级（**与改造前行为一致**）；
+            - ``window``：强制窗口限定；``desktop``：强制桌面级。
+        :param hwnd: 显式目标窗口句柄（优先级最高）
+        :param app: 应用线索（别名 / 进程名 / 标题），用于命中 ``AppContext`` 缓存
+        :param reuse_ttl: 本次调用的缓存 TTL 覆盖（秒）；``0`` 表示不读写缓存
+        :param state: 上游已判定的应用状态（仅审计回填）
         """
-        # 第 1 优先级：UIA
+        scope_mode, scope_hwnd, cached, scope_degraded, from_auto = self._resolve_locate_scope(
+            scope, app=app, hwnd=hwnd, window=window, reuse_ttl=reuse_ttl
+        )
+        if scope_mode == "window" and scope_hwnd:
+            window = self.window_from_hwnd(scope_hwnd) or window
+            if region is None and window is not None:
+                region = tuple(window.bounds)
+        elif scope_mode == "desktop":
+            window = None
+
         window_title = _window_title_of(window)
+
+        def _finish(
+            result: LocateResult,
+            *,
+            uia_ms: float = 0.0,
+            ocr_ms: float = 0.0,
+            candidates_count: int = 0,
+            done_scope: Optional[str] = None,
+            done_hwnd: Optional[int] = None,
+            degraded_reason: str = "",
+        ) -> LocateResult:
+            """回填 P0 字段（scope / 耗时 / 降级）并统一落 ``locate`` 审计。"""
+            final_scope = done_scope or scope_mode
+            final_hwnd = int(scope_hwnd if done_hwnd is None else done_hwnd)
+            result.scope = final_scope
+            result.scope_hwnd = final_hwnd
+            result.cached = bool(cached)
+            result.locate_ms = round(float(uia_ms) + float(ocr_ms), 3)
+            result.state = str(state or "")
+            final_reason = degraded_reason or scope_degraded
+            if final_reason:
+                result.degraded = True
+                result.degraded_reason = final_reason
+            _emit_locate(
+                result,
+                role=role,
+                window_title=window_title if final_scope == "window" else "",
+                uia_ms=uia_ms,
+                ocr_ms=ocr_ms,
+                candidates_count=candidates_count,
+                scope=final_scope,
+                scope_hwnd=final_hwnd,
+                cached=cached,
+                state=str(state or ""),
+                ensure_ms=ensure_ms,
+                launch_ms=launch_ms,
+                degraded_reason=final_reason,
+            )
+            if final_scope == "window" and app and final_hwnd:
+                # 命中即刷新缓存（TTL 滚动），供同一应用后续定位复用
+                self._ctx.set(
+                    app,
+                    final_hwnd,
+                    bounds=getattr(window, "bounds", None),
+                    title=window_title,
+                    state="ready",
+                )
+            return result
+
+        # 第 1 优先级：UIA
         started = time.perf_counter()
         element = self.accessibility.find_element(name=target, role=role, window=window, limit=1)
         uia_ms = (time.perf_counter() - started) * 1000.0
@@ -441,16 +728,9 @@ class UniversalController:
                 element=element,
                 detail=f"UIA 命中 role={element.role} name={element.name!r}",
             )
-            _emit_locate(
-                result,
-                role=role,
-                window_title=window_title,
-                uia_ms=uia_ms,
-                candidates_count=1,
-            )
-            return result
+            return _finish(result, uia_ms=uia_ms, candidates_count=1)
 
-        # 第 2 优先级：OCR
+        # 第 2 优先级：OCR（窗口限定时收敛到窗口 bounds 内，避免整屏 OCR）
         if use_ocr_fallback:
             started = time.perf_counter()
             hits = self.find_text_on_screen(target, fuzzy=fuzzy, region=region)
@@ -468,26 +748,39 @@ class UniversalController:
                     ocr_block=best,
                     detail=f"OCR 命中文本={best.text!r} bounds={best.bounds}",
                 )
-                _emit_locate(
-                    result,
-                    role=role,
-                    window_title=window_title,
-                    uia_ms=uia_ms,
-                    ocr_ms=ocr_ms,
-                    candidates_count=candidates,
+                return _finish(
+                    result, uia_ms=uia_ms, ocr_ms=ocr_ms, candidates_count=candidates
                 )
-                return result
+
+        # RF1 兜底：窗口限定未命中、且 scope 由 auto 解析而来 → 允许一次桌面级升级尝试
+        if scope_mode == "window" and from_auto and not scope_degraded:
+            started = time.perf_counter()
+            upgrade = self.accessibility.find_element(name=target, role=role, window=None, limit=1)
+            upgrade_ms = (time.perf_counter() - started) * 1000.0
+            if upgrade is not None and upgrade.is_clickable:
+                x, y = upgrade.center
+                result = LocateResult(
+                    target=target,
+                    found=True,
+                    source="uia",
+                    x=x,
+                    y=y,
+                    confidence=1.0,
+                    element=upgrade,
+                    detail=f"窗口内未命中，桌面级升级命中 role={upgrade.role} name={upgrade.name!r}",
+                )
+                return _finish(
+                    result,
+                    uia_ms=uia_ms + upgrade_ms,
+                    ocr_ms=ocr_ms,
+                    candidates_count=1,
+                    done_scope="desktop",
+                    done_hwnd=0,
+                    degraded_reason="scope_upgrade_desktop",
+                )
 
         result = LocateResult(target=target, found=False, detail="UIA 与 OCR 均未命中")
-        _emit_locate(
-            result,
-            role=role,
-            window_title=window_title,
-            uia_ms=uia_ms,
-            ocr_ms=ocr_ms,
-            candidates_count=candidates,
-        )
-        return result
+        return _finish(result, uia_ms=uia_ms, ocr_ms=ocr_ms, candidates_count=candidates)
 
     def locate_many(
         self,
@@ -495,10 +788,51 @@ class UniversalController:
         role: Optional[str] = None,
         window: Any = None,
         limit: int = 20,
+        scope: Optional[str] = None,
+        hwnd: Optional[int] = None,
+        app: Any = None,
+        reuse_ttl: Optional[float] = None,
     ) -> List[LocateResult]:
-        """定位全部匹配目标（仅 UIA + OCR 结果合并，按来源分组）。"""
-        results: List[LocateResult] = []
+        """定位全部匹配目标（仅 UIA + OCR 结果合并，按来源分组）。
+
+        P0（改动点 #1）：与 :meth:`locate` 共用同一套 ``scope`` 解析规则；
+        ``scope=auto`` 且无窗口线索时保持桌面级（旧行为不变）。
+        """
+        scope_mode, scope_hwnd, cached, scope_degraded, _from_auto = self._resolve_locate_scope(
+            scope, app=app, hwnd=hwnd, window=window, reuse_ttl=reuse_ttl
+        )
+        if scope_mode == "window" and scope_hwnd:
+            window = self.window_from_hwnd(scope_hwnd) or window
+        elif scope_mode == "desktop":
+            window = None
+        # 窗口限定时 OCR 只扫窗口 bounds，避免整屏 OCR（R2/R3）
+        ocr_region = tuple(window.bounds) if (scope_mode == "window" and window is not None) else None
+
         window_title = _window_title_of(window)
+
+        def _stamp(item: LocateResult, *, uia_ms: float, ocr_ms: float, total: int) -> None:
+            item.scope = scope_mode
+            item.scope_hwnd = int(scope_hwnd)
+            item.cached = bool(cached)
+            item.locate_ms = round(float(uia_ms) + float(ocr_ms), 3)
+            if scope_degraded:
+                item.degraded = True
+                item.degraded_reason = scope_degraded
+            _emit_locate(
+                item,
+                role=role,
+                window_title=window_title if scope_mode == "window" else "",
+                uia_ms=uia_ms,
+                ocr_ms=ocr_ms,
+                candidates_count=total,
+                multi=True,
+                scope=scope_mode,
+                scope_hwnd=int(scope_hwnd),
+                cached=cached,
+                degraded_reason=scope_degraded,
+            )
+
+        results: List[LocateResult] = []
         started = time.perf_counter()
         for element in self.accessibility.find_all_elements(
             name=target, role=role, window=window, limit=limit
@@ -522,7 +856,7 @@ class UniversalController:
         ocr_ms = 0.0
         if not results:
             started = time.perf_counter()
-            for block in self.find_text_on_screen(target):
+            for block in self.find_text_on_screen(target, region=ocr_region):
                 results.append(
                     LocateResult(
                         target=target,
@@ -539,26 +873,220 @@ class UniversalController:
 
         total = len(results)
         for result in results:
-            _emit_locate(
-                result,
-                role=role,
-                window_title=window_title,
-                uia_ms=uia_ms,
-                ocr_ms=ocr_ms,
-                candidates_count=total,
-                multi=True,
-            )
+            _stamp(result, uia_ms=uia_ms, ocr_ms=ocr_ms, total=total)
         if not results:
-            _emit_locate(
+            _stamp(
                 LocateResult(target=target, found=False, detail="UIA 与 OCR 均未命中"),
-                role=role,
-                window_title=window_title,
                 uia_ms=uia_ms,
                 ocr_ms=ocr_ms,
-                candidates_count=0,
-                multi=True,
+                total=0,
             )
         return results
+
+    # ------------------------------------------------------------ P0：scope / 缓存 / 唤起
+    def _resolve_locate_scope(
+        self,
+        scope: Optional[str] = None,
+        *,
+        app: Any = None,
+        hwnd: Optional[int] = None,
+        window: Any = None,
+        reuse_ttl: Optional[float] = None,
+    ) -> Tuple[str, int, bool, str, bool]:
+        """解析定位搜索域 → ``(mode, hwnd, cached, degraded_reason, from_auto)``。
+
+        ``mode`` ∈ ``{"window", "desktop"}``。``from_auto`` 表示 mode 由 ``auto`` 推导而来，
+        用于 RF1 的一次受限桌面级升级；显式声明的 ``scope`` 永不自动升级。
+        ``scope=auto`` 且无任何窗口线索时返回 ``desktop``——**保持改造前的旧行为**。
+        """
+        requested = str(scope or "").strip().lower()
+        from_auto = False
+        if requested not in _SCOPE_MODES:
+            requested = _scope_default()
+            from_auto = True
+        hinted_hwnd = int(hwnd or 0) or int(getattr(window, "hwnd", 0) or 0)
+        if requested == "window":
+            if hinted_hwnd:
+                return "window", hinted_hwnd, False, "", from_auto
+            # 显式要求窗口限定却拿不到窗口句柄 → 显式降级，禁止静默换成桌面级
+            return "desktop", 0, False, "scope_window_unresolved", from_auto
+        if requested == "desktop":
+            return "desktop", 0, False, "", from_auto
+        # auto：hwnd > window > AppContext 缓存 > 桌面级（旧行为）
+        if hinted_hwnd:
+            return "window", hinted_hwnd, False, "", from_auto
+        entry = self._ctx_lookup(app, reuse_ttl)
+        if entry is not None:
+            return "window", int(entry.hwnd), True, "", from_auto
+        return "desktop", 0, False, "", from_auto
+
+    def _ctx_lookup(self, app: Any, reuse_ttl: Optional[float] = None) -> Optional[AppContextEntry]:
+        """按应用取缓存窗口；命中前校验 hwnd 仍有效，失效即清除（避免点到已关闭窗口）。"""
+        if not app:
+            return None
+        if reuse_ttl is not None and float(reuse_ttl) <= 0:
+            return None
+        entry = self._ctx.get(app)
+        if entry is None:
+            return None
+        if reuse_ttl is not None and float(reuse_ttl) > 0 and entry.expired(float(reuse_ttl)):
+            return None
+        if self.window_from_hwnd(int(entry.hwnd)) is None:
+            self._ctx.invalidate(app)
+            return None
+        return entry
+
+    def app_context_stats(self) -> Dict[str, Any]:
+        """``AppContext`` 缓存统计（只读，供自检与诊断）。"""
+        return self._ctx.stats()
+
+    def ensure_window(
+        self,
+        app: Any = None,
+        hwnd: Optional[int] = None,
+        title: Optional[str] = None,
+        process_name: Optional[str] = None,
+        restore: bool = True,
+        activate: bool = True,
+        reuse_ttl: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """P0-lite 唤起：一次调用内完成"解析目标窗口 → 唤醒/置前 → 回填缓存"。
+
+        P0 阶段只覆盖 S1（可见）/ S2（任务栏最小化）/ S3（托盘隐藏）；S4（未启动）返回
+        ``state="not_running"`` + ``degraded_reason="app_not_running"``，**不尝试启动**
+        （启动能力属 P2，见方案改动点 #13~#16）。全部复用既有 ``find_window`` +
+        ``activate_window``，不新增 Win32 原语。
+        """
+        started = time.perf_counter()
+        audit = get_audit_logger()
+        app_name = str(app or "").strip()
+        cached = False
+        window = None
+        if hwnd:
+            window = self.window_from_hwnd(int(hwnd))
+        if window is None and app_name:
+            entry = self._ctx_lookup(app_name, reuse_ttl)
+            if entry is not None:
+                window = self.window_from_hwnd(int(entry.hwnd))
+                cached = window is not None
+        if window is None and (title or process_name):
+            window = self.find_window(title=title, process_name=process_name)
+        if window is None and app_name:
+            window = self.find_window(title=app_name) or self.find_window(process_name=app_name)
+        resolve_ms = (time.perf_counter() - started) * 1000.0
+
+        if window is None:
+            total_ms = (time.perf_counter() - started) * 1000.0
+            payload: Dict[str, Any] = {
+                "found": False,
+                "activated": False,
+                "hwnd": 0,
+                "activated_hwnd": 0,
+                "app": app_name,
+                "state": "not_running",
+                "cached": False,
+                "degraded": True,
+                "degraded_reason": "app_not_running",
+                "ensure_ms": round(total_ms, 3),
+                "timing": {
+                    "snapshot_ms": round(resolve_ms, 3),
+                    "activate_ms": 0.0,
+                    "total_ms": round(total_ms, 3),
+                    "launch_ms": None,
+                },
+                "detail": (
+                    f"未找到应用窗口（app={app_name!r} title={title!r} "
+                    f"process_name={process_name!r}）；P0 不提供启动能力"
+                ),
+            }
+            if audit is not None:
+                audit.log_ensure(
+                    app=app_name,
+                    state="not_running",
+                    hwnd=0,
+                    activated=False,
+                    ensure_ms=round(total_ms, 3),
+                    degraded=True,
+                    degraded_reason="app_not_running",
+                    detail=payload["detail"],
+                )
+            return payload
+
+        target_hwnd = int(getattr(window, "hwnd", 0) or 0)
+        visible = bool(getattr(window, "visible", True))
+        iconic = bool(getattr(window, "iconic", False))
+        cloaked = bool(getattr(window, "cloaked", False))
+        if cloaked:
+            state = "cloaked"       # UWP 挂起：不计入 S1~S3
+        elif not visible:
+            state = "hidden"        # S3 托盘驻留 / 隐藏
+        elif iconic:
+            state = "minimized"     # S2 任务栏最小化
+        else:
+            state = "visible"       # S1 可见窗口
+
+        activate_ms = 0.0
+        result: Dict[str, Any] = {"activated": False, "hwnd": target_hwnd, "detail": "未请求置前"}
+        if activate:
+            act_started = time.perf_counter()
+            result = self.accessibility.activate_window(window, restore=restore, show_hidden=True) or {}
+            activate_ms = (time.perf_counter() - act_started) * 1000.0
+        activated = bool(result.get("activated"))
+        activated_hwnd = int(result.get("hwnd") or target_hwnd)
+        total_ms = (time.perf_counter() - started) * 1000.0
+        degraded = not activated
+        degraded_reason = ""
+        if not activated:
+            degraded_reason = "activate_failed"
+        elif cloaked:
+            degraded_reason = "app_window_cloaked"
+        if target_hwnd and state in ("visible", "minimized", "hidden"):
+            self._ctx.set(
+                app_name
+                or getattr(window, "app_alias", "")
+                or str(getattr(window, "process_name", "") or ""),
+                target_hwnd,
+                bounds=getattr(window, "bounds", None),
+                title=str(getattr(window, "name", "") or ""),
+                process_name=str(getattr(window, "process_name", "") or ""),
+                state="ready",
+            )
+        payload = {
+            "found": True,
+            "activated": activated,
+            "hwnd": target_hwnd,
+            "activated_hwnd": activated_hwnd,
+            "app": app_name,
+            "state": state,
+            "cached": cached,
+            "degraded": degraded,
+            "degraded_reason": degraded_reason,
+            "ensure_ms": round(total_ms, 3),
+            "timing": {
+                "snapshot_ms": round(resolve_ms, 3),
+                "activate_ms": round(activate_ms, 3),
+                "total_ms": round(total_ms, 3),
+                "launch_ms": None,
+            },
+            "hint": str(result.get("hint") or ""),
+            "covered": result.get("covered"),
+            "detail": str(result.get("detail") or ""),
+        }
+        if audit is not None:
+            audit.log_ensure(
+                app=app_name,
+                state=state,
+                hwnd=target_hwnd,
+                activated=activated,
+                activated_hwnd=activated_hwnd,
+                cached=cached,
+                ensure_ms=round(total_ms, 3),
+                timing=payload["timing"],
+                degraded=degraded,
+                degraded_reason=degraded_reason,
+                detail=payload["detail"],
+            )
+        return payload
 
     # ============================================================ 写操作
     def click(
@@ -570,10 +1098,37 @@ class UniversalController:
         clicks: int = 1,
         use_ocr_fallback: bool = True,
         verify: bool = False,
+        window: Any = None,
+        region: Optional[Rect] = None,
+        scope: Optional[str] = None,
+        hwnd: Optional[int] = None,
+        app: Any = None,
+        reuse_ttl: Optional[float] = None,
+        state: str = "",
+        ensure_ms: Optional[float] = None,
+        launch_ms: Optional[float] = None,
     ) -> LocateResult:
-        """点击目标：既可传 ``target``（走 UIA→OCR 定位），也可传坐标 ``x``/``y``。"""
+        """点击目标：既可传 ``target``（走 UIA→OCR 定位），也可传坐标 ``x``/``y``。
+
+        P0（改动点 #4）：新增 ``window`` / ``region`` / ``scope`` / ``hwnd`` / ``app`` /
+        ``reuse_ttl``，与 :meth:`locate` 共用同一套搜索域解析。上层因此可以在一次调用里
+        完成"唤起（:meth:`ensure_window`）→ 窗口内定位 → 点击"，避免同一目标被独立搜索
+        两次（R3/R4）。``ensure_ms`` / ``launch_ms`` / ``state`` 为上游唤起阶段的审计回填。
+        """
         if target is not None:
-            located = self.locate(target, use_ocr_fallback=use_ocr_fallback)
+            located = self.locate(
+                target,
+                use_ocr_fallback=use_ocr_fallback,
+                window=window,
+                region=region,
+                scope=scope,
+                hwnd=hwnd,
+                app=app,
+                reuse_ttl=reuse_ttl,
+                state=state,
+                ensure_ms=ensure_ms,
+                launch_ms=launch_ms,
+            )
             if not located.found:
                 return located
             x, y = located.x, located.y
@@ -634,6 +1189,20 @@ class UniversalController:
             }
             if located.hit_window:
                 payload["hit_window"] = located.hit_window
+            # ---- P0（改动点 #5）：新增列，不参与旧口径计算 ----
+            payload["scope"] = str(getattr(located, "scope", "") or "")
+            if int(getattr(located, "scope_hwnd", 0) or 0):
+                payload["scope_hwnd"] = int(located.scope_hwnd)
+            payload["cached"] = bool(getattr(located, "cached", False))
+            payload["locate_ms"] = round(float(getattr(located, "locate_ms", 0.0) or 0.0), 3)
+            payload["state"] = str(state or getattr(located, "state", "") or "")
+            if ensure_ms is not None:
+                payload["ensure_ms"] = round(float(ensure_ms), 3)
+            if launch_ms is not None:
+                payload["launch_ms"] = round(float(launch_ms), 3)
+            if getattr(located, "degraded_reason", ""):
+                payload["degraded"] = True
+                payload["degraded_reason"] = located.degraded_reason
             if verify:
                 payload["verified"] = _element_snapshot(after)
             audit.log_action("click", **payload)

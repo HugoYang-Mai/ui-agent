@@ -11,7 +11,10 @@
 * ``UI_AGENT_AUDIT=0`` 时完全关闭：不建目录、不落文件。
 
 事件类型：``tool_call`` / ``tool_result``（MCP 层）、``locate``（定位层）、
-``action``（写操作层）、``run_start`` / ``run_end``（任务归组）。
+``action``（写操作层）、``run_start`` / ``run_end``（任务归组）；
+P0（改动点 #5）新增 ``ensure``（应用唤起）与 ``launch``（启动，P2 起产生）两类事件，
+并为 ``locate`` / ``action`` 增加 ``state`` / ``scope`` / ``ensure_ms`` / ``launch_ms`` /
+``degraded_reason`` 等字段（**均为新增列，不参与旧口径计算**）。
 """
 
 from __future__ import annotations
@@ -32,6 +35,26 @@ _FALSE_VALUES = {"0", "false", "no", "off", "n", "f"}
 _TEXT_POLICIES = ("mask", "hash", "full")
 _DEFAULT_KEEP_DAYS = 14
 _DEFAULT_RUN_GAP = 8.0
+
+#: P0（应用唤起与定位优化方案 改动点 #5）：``degraded_reason`` 取值枚举。
+#: 任何"部分成功"都必须在返回体与审计中以 ``degraded`` + ``degraded_reason`` 暴露，
+#: 禁止静默返回一个可能点不中的坐标。
+DEGRADED_REASONS = (
+    "app_not_running",          # S4：应用未启动（P0 不提供启动能力）
+    "app_window_cloaked",       # 命中的窗口处于 cloaked（UWP 挂起）
+    "activate_failed",          # 置前未成功（前台锁定等）
+    "foreground_locked",        # 前台被系统策略锁定（RF2）
+    "scope_window_unresolved",  # 显式要求窗口限定但解析不到窗口句柄
+    "scope_upgrade_desktop",    # 窗口内未命中 → 升级为桌面级搜索（RF1 兜底）
+    "window_not_found",         # 目标窗口不存在
+    "launch_search_fallback",   # 启动入口走开始菜单兜底（P2）
+    "launch_timeout",           # 启动后等待窗口超时（P2）
+)
+
+
+def is_known_degraded_reason(reason: Any) -> bool:
+    """是否为已登记的降级原因（未知原因也允许落盘，仅用于统计分组）。"""
+    return str(reason or "") in DEGRADED_REASONS
 
 
 # ===================================================================== 配置
@@ -295,10 +318,55 @@ class AuditLogger:
             return None
 
     def log_action(self, action: str, **fields: Any) -> Optional[Dict[str, Any]]:
-        """落一条写操作事件。"""
+        """落一条写操作事件。
+
+        P0（改动点 #5）起可携带 ``state`` / ``scope`` / ``ensure_ms`` / ``launch_ms`` /
+        ``degraded_reason`` 等新增字段（只增不删，旧读取方不受影响）。
+        """
         payload: Dict[str, Any] = {"action": action}
         payload.update(fields)
         return self.log("action", **payload)
+
+    def log_locate(self, **fields: Any) -> Optional[Dict[str, Any]]:
+        """落一条 ``locate`` 事件（定位层）。
+
+        P0 关键字段：``scope``（``window`` / ``desktop``）、``scope_hwnd``、
+        ``cached``（是否命中 ``AppContext`` 缓存）、``locate_ms``、``found``、``source``
+        （``uia`` / ``ocr``）、``state``、``degraded_reason``。
+        """
+        payload: Dict[str, Any] = {"degraded_reason": ""}
+        payload.update(fields)
+        return self.log("locate", **payload)
+
+    def log_ensure(self, **fields: Any) -> Optional[Dict[str, Any]]:
+        """落一条 ``ensure`` 事件（应用唤起：状态判定 → 唤醒/置前 → 回填缓存）。
+
+        关键字段：``app``、``state``（``visible`` / ``minimized`` / ``hidden`` /
+        ``cloaked`` / ``not_running``）、``hwnd``、``activated``、``activated_hwnd``、
+        ``cached``、``ensure_ms``、``timing{snapshot_ms, activate_ms, total_ms, launch_ms}``、
+        ``degraded``、``degraded_reason``。
+        """
+        payload: Dict[str, Any] = {
+            "degraded": False,
+            "degraded_reason": "",
+            "timing": {},
+        }
+        payload.update(fields)
+        return self.log("ensure", **payload)
+
+    def log_launch(self, **fields: Any) -> Optional[Dict[str, Any]]:
+        """落一条 ``launch`` 事件（启动能力）。
+
+        P0 不实现启动（属 P2，改动点 #13~#16），此方法仅固化字段契约：
+        ``app``、``resolved_by``、``target_path``、``pid``、``launch_ms``、``wait_ms``、
+        ``dry_run``、``degraded_reason``。
+        """
+        payload: Dict[str, Any] = {
+            "dry_run": False,
+            "degraded_reason": "",
+        }
+        payload.update(fields)
+        return self.log("launch", **payload)
 
     def close(self) -> None:
         """收尾：补一条 ``run_end`` 并关闭文件句柄。"""
@@ -415,8 +483,32 @@ def iter_records(
                 yield record
 
 
+def _percentile(values: List[float], ratio: float) -> float:
+    """线性插值分位数（供 P0 耗时验收的 P50 / P95 口径使用）。"""
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return round(ordered[0], 3)
+    position = (len(ordered) - 1) * float(ratio)
+    low = int(position)
+    high = min(low + 1, len(ordered) - 1)
+    weight = position - low
+    return round(ordered[low] * (1 - weight) + ordered[high] * weight, 3)
+
+
 def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """汇总统计：调用次数 / 命中来源占比 / 兜底率 / 失败率 / 平均耗时。"""
+    """汇总统计：调用次数 / 命中来源占比 / 兜底率 / 失败率 / 平均耗时。
+
+    P0（改动点 #5）新增以下口径，**全部为附加字段，旧调用方解析逻辑不受影响**：
+
+    * ``locate`` 下新增 ``window`` / ``desktop`` / ``desktop_ratio``（验收口径
+      "桌面级定位占比 <10%"）、``cached``（``AppContext`` 命中数）、
+      ``avg_locate_ms`` / ``locate_p50_ms`` / ``locate_p95_ms``（验收口径 "P95 ≤150 ms"）；
+    * 新增 ``ensure``：唤起次数、``states`` 状态分布、耗时分位、降级分布；
+    * 新增 ``launch``：启动次数与耗时（P2 起才有数据）；
+    * 新增 ``degraded_reasons``：全局降级原因分布。
+    """
     events: Dict[str, int] = {}
     tool_calls: Dict[str, int] = {}
     sessions = set()
@@ -425,6 +517,14 @@ def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     failures = 0
     results = 0
     locate_total = locate_found = locate_uia = locate_ocr = locate_fallback = 0
+    locate_window = locate_desktop = locate_cached = 0
+    locate_millis: List[float] = []
+    ensure_total = 0
+    ensure_millis: List[float] = []
+    states: Dict[str, int] = {}
+    launch_total = 0
+    launch_millis: List[float] = []
+    degraded: Dict[str, int] = {}
     first_ts = last_ts = ""
 
     for record in records:
@@ -438,6 +538,10 @@ def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
         if ts:
             first_ts = first_ts or ts
             last_ts = ts
+
+        reason = str(record.get("degraded_reason") or "")
+        if reason:
+            degraded[reason] = degraded.get(reason, 0) + 1
 
         if event == "tool_call":
             tool = str(record.get("tool") or "")
@@ -460,6 +564,29 @@ def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             elif source == "ocr":
                 locate_ocr += 1
                 locate_fallback += 1
+            # 旧记录无 scope 字段 → 归入 desktop（与改造前 100% 桌面级基线一致）
+            if str(record.get("scope") or "desktop") == "window":
+                locate_window += 1
+            else:
+                locate_desktop += 1
+            if record.get("cached"):
+                locate_cached += 1
+            locate_ms = record.get("locate_ms")
+            if isinstance(locate_ms, (int, float)):
+                locate_millis.append(float(locate_ms))
+        elif event == "ensure":
+            ensure_total += 1
+            state = str(record.get("state") or "")
+            if state:
+                states[state] = states.get(state, 0) + 1
+            ensure_ms = record.get("ensure_ms")
+            if isinstance(ensure_ms, (int, float)):
+                ensure_millis.append(float(ensure_ms))
+        elif event == "launch":
+            launch_total += 1
+            launch_ms = record.get("launch_ms")
+            if isinstance(launch_ms, (int, float)):
+                launch_millis.append(float(launch_ms))
 
     def _ratio(part: int, whole: int) -> float:
         return round(part / whole, 4) if whole else 0.0
@@ -486,5 +613,34 @@ def summarize(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             "ocr_ratio": _ratio(locate_ocr, locate_total),
             "fallback_count": locate_fallback,
             "fallback_rate": _ratio(locate_fallback, locate_total),
+            # ---- P0 新增 ----
+            "window": locate_window,
+            "desktop": locate_desktop,
+            "desktop_ratio": _ratio(locate_desktop, locate_total),
+            "cached": locate_cached,
+            "avg_locate_ms": (
+                round(sum(locate_millis) / len(locate_millis), 3) if locate_millis else 0.0
+            ),
+            "locate_p50_ms": _percentile(locate_millis, 0.5),
+            "locate_p95_ms": _percentile(locate_millis, 0.95),
+            "locate_max_ms": round(max(locate_millis), 3) if locate_millis else 0.0,
         },
+        # ---- P0 新增事件口径 ----
+        "ensure": {
+            "total": ensure_total,
+            "states": states,
+            "avg_ensure_ms": (
+                round(sum(ensure_millis) / len(ensure_millis), 3) if ensure_millis else 0.0
+            ),
+            "ensure_p50_ms": _percentile(ensure_millis, 0.5),
+            "ensure_p95_ms": _percentile(ensure_millis, 0.95),
+        },
+        "launch": {
+            "total": launch_total,
+            "avg_launch_ms": (
+                round(sum(launch_millis) / len(launch_millis), 3) if launch_millis else 0.0
+            ),
+            "max_launch_ms": round(max(launch_millis), 3) if launch_millis else 0.0,
+        },
+        "degraded_reasons": degraded,
     }

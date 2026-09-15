@@ -389,7 +389,17 @@ def _op_find(
     use_ocr_fallback: bool,
     fuzzy: bool,
     limit: int,
+    app: Optional[str] = None,
+    hwnd: Optional[int] = None,
+    scope: Optional[str] = None,
+    reuse_ttl: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """定位目标（只读）。
+
+    P0（改动点 #3）：新增 ``app`` / ``hwnd`` / ``scope`` / ``reuse_ttl``，搜索域解析统一
+    交给内核（``scope=auto`` 时 hwnd > window > AppContext 缓存 > 桌面级）。
+    旧调用 ``ui_find(target)`` 不传任何新参数时行为与改造前**完全一致**（桌面级 + OCR 兜底）。
+    """
     window = None
     region = None
     if window_title:
@@ -399,6 +409,7 @@ def _op_find(
         if window.is_clickable:
             region = tuple(window.bounds)
 
+    hinted_hwnd = int(hwnd) if hwnd else None
     located = ctrl.locate(
         target,
         use_ocr_fallback=use_ocr_fallback,
@@ -406,12 +417,30 @@ def _op_find(
         role=role,
         fuzzy=fuzzy,
         region=region,
+        scope=scope,
+        hwnd=hinted_hwnd,
+        app=app,
+        reuse_ttl=reuse_ttl,
     )
     payload = located.to_dict()
     payload["ok"] = bool(located.found)
+    if str(getattr(located, "scope", "")) == "desktop" and not (hwnd or window_title or app):
+        payload["scope_hint"] = (
+            "本次为桌面级搜索（未提供 app / hwnd / window_title）；"
+            "传入 app 或 hwnd 可限定到目标窗口，桌面根遍历约 484 ms，窗口限定通常 <15 ms。"
+        )
 
     if limit and int(limit) > 1:
-        matches = ctrl.locate_many(target, role=role, window=window, limit=int(limit))
+        matches = ctrl.locate_many(
+            target,
+            role=role,
+            window=window,
+            limit=int(limit),
+            scope=scope,
+            hwnd=hinted_hwnd,
+            app=app,
+            reuse_ttl=reuse_ttl,
+        )
         payload["matches"] = [m.to_dict(with_element=False) for m in matches]
         payload["match_count"] = len(matches)
     return payload
@@ -426,9 +455,54 @@ def _op_click(
     clicks: int,
     verify: bool,
     use_ocr_fallback: bool,
+    app: Optional[str] = None,
+    hwnd: Optional[int] = None,
+    scope: Optional[str] = None,
+    reuse_ttl: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """点击目标（写操作）。
+
+    P0（改动点 #4）：传 ``app``（或 ``hwnd``）时，在**一次调用**内完成
+    "唤起/置前（``ensure_window``）→ 窗口内定位 → 点击"，把原本 2~3 次工具往返合并为 1 次
+    （R3/R4），并返回 ``timing{ensure_ms, locate_ms, click_ms}``（``click_ms`` 为点击阶段
+    整体耗时，含定位与鼠标动作）与 ``state``。
+    ``verify`` / ``use_ocr_fallback`` / 遮挡抬窗（``_click_guard_hwnd`` +
+    ``restore_after_boost``）语义不变；不传 ``app`` / ``hwnd`` 时行为与改造前完全一致。
+    """
     if target is None and (x is None or y is None):
         return {"ok": False, "error": "必须提供 target，或同时提供 x / y 坐标"}
+
+    ensure: Dict[str, Any] = {}
+    timing: Dict[str, Any] = {}
+    if app or hwnd:
+        ensure = ctrl.ensure_window(
+            app=app,
+            hwnd=int(hwnd) if hwnd else None,
+            reuse_ttl=reuse_ttl,
+        )
+        timing["ensure_ms"] = ensure.get("ensure_ms", 0.0)
+        timing["snapshot_ms"] = (ensure.get("timing") or {}).get("snapshot_ms", 0.0)
+        if not ensure.get("found"):
+            return {
+                "ok": False,
+                "found": False,
+                "error": ensure.get("detail") or "未找到目标应用窗口",
+                "state": ensure.get("state", ""),
+                "degraded": True,
+                "degraded_reason": ensure.get("degraded_reason", ""),
+                "ensure": ensure,
+                "timing": timing,
+                "hint": (
+                    "P0 不提供启动能力（未启动场景属 P2）；"
+                    "可先用 ui_window_list 确认应用是否在运行，或由上层启动后再重试。"
+                ),
+            }
+        if not hwnd:
+            hwnd = int(ensure.get("hwnd") or 0) or None
+        # 已锁定目标窗口 → 强制窗口限定，避免退化为桌面级全树搜索
+        scope = scope or "window"
+
+    click_started = time.perf_counter()
     located = ctrl.click(
         target=target,
         x=x,
@@ -437,9 +511,30 @@ def _op_click(
         clicks=int(clicks),
         use_ocr_fallback=use_ocr_fallback,
         verify=verify,
+        scope=scope,
+        hwnd=int(hwnd) if hwnd else None,
+        app=app,
+        reuse_ttl=reuse_ttl,
+        state=str(ensure.get("state") or ""),
+        ensure_ms=ensure.get("ensure_ms"),
     )
+    click_ms = (time.perf_counter() - click_started) * 1000.0
     payload = located.to_dict()
     payload["ok"] = bool(located.found)
+    timing["locate_ms"] = round(float(getattr(located, "locate_ms", 0.0) or 0.0), 3)
+    timing["click_ms"] = round(click_ms, 3)
+    timing["total_ms"] = round(float(timing.get("ensure_ms") or 0.0) + click_ms, 3)
+    payload["timing"] = timing
+    if ensure:
+        payload["ensure"] = {
+            "app": ensure.get("app", ""),
+            "state": ensure.get("state", ""),
+            "hwnd": ensure.get("hwnd", 0),
+            "cached": ensure.get("cached", False),
+            "degraded": ensure.get("degraded", False),
+            "degraded_reason": ensure.get("degraded_reason", ""),
+            "ensure_ms": ensure.get("ensure_ms", 0.0),
+        }
     if not located.found:
         payload["error"] = "目标未找到，未执行点击"
     else:
@@ -646,7 +741,9 @@ async def ui_activate_window(
     name="ui_find",
     description=(
         "定位界面目标并返回屏幕坐标（只读，不点击）。先用 UI Automation 按名称/角色查找，"
-        "未命中时可回退到 OCR 文字定位。可传 window_title 把搜索范围限制在某个窗口内。"
+        "未命中时可回退到 OCR 文字定位。搜索范围默认自动限定到目标窗口：传 app（应用别名/"
+        "进程名）或 hwnd 即可把搜索收敛到该窗口内（窗口限定通常 <15 ms，桌面级全树遍历"
+        "约 484 ms）。不传任何窗口线索时保持桌面级搜索（与旧行为一致）。"
     ),
 )
 async def ui_find(
@@ -664,6 +761,33 @@ async def ui_find(
     limit: Annotated[
         int, Field(description="返回的候选命中数量上限（1-50），>1 时附带 matches 列表", ge=1, le=50)
     ] = 1,
+    app: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "应用线索（别名 / 进程名 / 标题片段，如 '微信' / 'notepad.exe'）："
+                "命中缓存时把搜索限定到该应用窗口，推荐优先使用"
+            )
+        ),
+    ] = None,
+    hwnd: Annotated[
+        Optional[int],
+        Field(description="目标窗口句柄（优先级最高，可用 ui_window_list / ui_click 返回值获取）", ge=1),
+    ] = None,
+    scope: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "搜索域：auto（默认，有 app/hwnd/window_title 或缓存命中则窗口限定，否则桌面级）/ "
+                "window（强制窗口限定）/ desktop（强制桌面级）"
+            ),
+            pattern="^(auto|window|desktop)$",
+        ),
+    ] = None,
+    reuse_ttl: Annotated[
+        Optional[float],
+        Field(description="AppContext 缓存复用秒数（缺省走全局配置 UIAGENT_CTX_TTL；0 表示不使用缓存）", ge=0.0, le=600.0),
+    ] = None,
 ) -> str:
     """定位元素 / 界面文字。"""
     return await _guard(
@@ -674,6 +798,10 @@ async def ui_find(
         use_ocr_fallback,
         fuzzy,
         limit,
+        app,
+        hwnd,
+        scope,
+        reuse_ttl,
         tool="ui_find",
         audit_args={
             "target": target,
@@ -682,6 +810,10 @@ async def ui_find(
             "use_ocr_fallback": use_ocr_fallback,
             "fuzzy": fuzzy,
             "limit": limit,
+            "app": app,
+            "hwnd": hwnd,
+            "scope": scope,
+            "reuse_ttl": reuse_ttl,
         },
     )
 
@@ -689,8 +821,10 @@ async def ui_find(
 @server.tool(
     name="ui_click",
     description=(
-        "点击目标（写操作）。可传 target 走「UIA → OCR」定位后点击，也可直接传坐标 x/y。"
-        "返回实际点击坐标与定位来源（uia / ocr / coords）。"
+        "点击目标（写操作）。推荐传 app（应用别名/进程名）+ target：一次调用内完成"
+        "「唤起/置前 → 窗口内定位 → 点击」，避免同一目标被重复搜索，并返回 "
+        "timing{ensure_ms, locate_ms, click_ms}。也可传 hwnd 精确指定窗口，"
+        "或直接传坐标 x/y。不传 app / hwnd 时走旧链路（桌面级定位 + OCR 兜底）。"
     ),
 )
 async def ui_click(
@@ -707,6 +841,33 @@ async def ui_click(
     use_ocr_fallback: Annotated[
         bool, Field(description="target 定位失败时是否用 OCR 兜底，默认 true")
     ] = True,
+    app: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "应用线索（别名 / 进程名，如 '微信' / 'notepad.exe'）：传入后本次调用会在"
+                "点击前自动唤醒并置前该应用窗口，再把定位限定在窗口内（推荐）"
+            )
+        ),
+    ] = None,
+    hwnd: Annotated[
+        Optional[int],
+        Field(description="目标窗口句柄（可按应用别名解析出窗口后使用，优先级最高）", ge=1),
+    ] = None,
+    scope: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "搜索域：auto（默认）/ window（强制窗口限定）/ desktop（强制桌面级）；"
+                "传了 app / hwnd 时缺省视为 window"
+            ),
+            pattern="^(auto|window|desktop)$",
+        ),
+    ] = None,
+    reuse_ttl: Annotated[
+        Optional[float],
+        Field(description="AppContext 缓存复用秒数（缺省走全局配置 UIAGENT_CTX_TTL；0 表示不使用缓存）", ge=0.0, le=600.0),
+    ] = None,
 ) -> str:
     """点击目标。"""
     return await _guard(
@@ -718,6 +879,10 @@ async def ui_click(
         clicks,
         verify,
         use_ocr_fallback,
+        app,
+        hwnd,
+        scope,
+        reuse_ttl,
         tool="ui_click",
         audit_args={
             "target": target,
@@ -727,6 +892,10 @@ async def ui_click(
             "clicks": clicks,
             "verify": verify,
             "use_ocr_fallback": use_ocr_fallback,
+            "app": app,
+            "hwnd": hwnd,
+            "scope": scope,
+            "reuse_ttl": reuse_ttl,
         },
     )
 

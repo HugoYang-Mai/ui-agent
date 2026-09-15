@@ -302,6 +302,11 @@ P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → �
 - **窗口标题不可靠**：微信 / QQ 等应用窗口标题是登录昵称，判断归属请用 `app_alias` / `process_name`；定位优先用 `hwnd` / `class_name`。
 - **隐藏窗口不是"未运行"**：只看 `visible=true` 会误判；隐藏 / 托盘窗口在列表中 `visible=false`，可用 `hwnd` 唤醒激活。
 - **置顶窗口遮挡**：置顶窗口会盖住同区域普通窗口；`activate_window` 返回 `covered` / `covered_by` / `hint`，`click` 会自动临时抬升目标窗口并返回 `auto_raise` / `hit_window`。
+- **输入法会拦截"纯 ASCII 串"的键盘输入**：`ui_type` 的 `auto` 分流是**整串级**——含中文走剪贴板，**纯 ASCII 串（如 `a1b2c3`）走键盘注入**，中文输入法激活时会被组字 / 候选吞掉或串码（实测 `a1b2c3` → `啊靶场`）。需要精确落字时显式 `method="clipboard"`，或先切英文输入法；剪贴板模式会**覆盖系统剪贴板**（内核不备份 / 恢复），输入后应回读校验（`chars` 只是发出字符数）。
+- **键盘类写操作前必须先取前台焦点**：`ui_type` / `ui_hotkey` 把按键发给**当前前台窗口的焦点控件**，二者都不负责置焦；`ctrl+s` / `alt+f4` 前先用 `ui_activate_window(hwnd=…)` 或 `ui_app_ensure(require_foreground=true)`，并复核 `activated` / `state`（`degraded_reason=foreground_locked` 表示窗口已唤醒但未占前台，此时发键可能落到别的窗口）。
+- **保存 / 关闭不能用 `ok=true` 判定**：`ctrl+s` 后回读磁盘（文件内容 / `mtime`）确认落盘（无路径的新文档会弹「另存为」）；`alt+f4` 前先保存（有未保存修改会弹确认框阻塞关闭），关闭成功以 **`hwnd` 消失**为准（`ui_window_list(include_invisible=true)` 中不再出现该 `hwnd`，等价 `user32.IsWindow(hwnd)==false`）。
+- **`ui_app_status` 的 `state` 是"应用最优窗口"口径**：`select_best_window` 取「可见未最小化 > 可见已最小化 > 隐藏、同档面积最大」的窗口，多窗口应用隐藏其中一个后应用级 `state` 仍可能为 `visible`（**口径使然，不是缓存陈旧**）；判断特定窗口请按 `hwnd` 查 `candidates[].state`，或用 `ui_window_list(include_invisible=true)`。
+- **`AppContext` 缓存（`UIAGENT_CTX_TTL`，默认 30 s）只缓存"窗口线索"，不缓存状态**：`ui_app_status` 的 `state` 每次调用由实时枚举推导（`EnumWindows` + `IsWindowVisible` / `IsIconic` / cloaked），因此该变量**无法改善状态新鲜度**；`cached` / `cached_hwnd` / `cached_age_ms` 属历史线索，不得用于状态 / 关闭裁决。设 `UIAGENT_CTX_TTL=0` 只会关闭"窗口搜索域复用"（`ui_find` / `ui_click` 退化为桌面级定位、`ui_app_ensure` 每次重新枚举），属性能回退；个别调用想不读不写缓存可用 `reuse_ttl=0`。完整调用约定见 [`docs/mcp-server.md`](docs/mcp-server.md) §7.1。
 - **启动能力（P2）会真实拉起进程**：`ui_launch_app` / `ui_wait_window` 默认启用（`UIAGENT_LAUNCH_ENABLED=1`）；`UIAGENT_LAUNCH_ENABLED=0` 时整条链路直接拒绝（`degraded_reason=launch_disabled`，含 `dry_run`）；`UIAGENT_LAUNCH_ALLOWLIST` **默认启用安全白名单**：未设置 / 空白时套用内置默认白名单（只含记事本、计算器、画图、资源管理器、Edge、微信等常用应用，**不含** `cmd` / `powershell` / 终端等命令解释器），显式配置时以配置为准（可放开默认之外的入口），显式设为 `*` / `all` 表示不校验（显式解除限制）；不在生效白名单内 → `degraded_reason=not_allowlisted`，返回体 `hint` 标注拒绝来源与放开方式。建议先用 `dry_run=true` 预演解析结果再真实启动。`ensure_app` / `ui_app_ensure` 自身不启动进程，`launch_if_missing=true` 才交由启动链路接管；`degraded=true` 表示未达最优就绪状态而非失败。
 - **审计日志本地落盘**：`logs\audit-*.jsonl` 含调用参数（已脱敏）与窗口信息，敏感环境用 `UI_AGENT_AUDIT=0` 关闭。
 - **CLI stdout 为结构化 JSON**，日志走 stderr，便于 MCP Server 直接以子进程方式包裹。
@@ -326,7 +331,7 @@ P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → �
 | `ui_wait_window` | 只读 | 等待窗口出现并完成布局（P2）：三选一定位 `hwnd` > `pid` > `app`（`app` 支持别名 / 进程名，含打包应用兜底键），返回 `state` / `waited_ms` / `stable`；替代上层"睡眠 + 反复轮询" |
 | `ui_find` | 只读 | 定位元素或界面文字（UIA → OCR 兜底） |
 | `ui_click` | 写 | 定位式点击或坐标点击；目标点被置顶窗口遮挡时自动临时抬升目标窗口，返回 `auto_raise` / `hit_window` |
-| `ui_type` | 写 | 输入文本（中文自动走剪贴板） |
+| `ui_type` | 写 | 输入文本（含中文自动走剪贴板；**纯 ASCII 串走键盘注入，中文输入法激活时会被 IME 吞字 / 串码**，需精确落字时显式 `method="clipboard"`） |
 | `ui_hotkey` | 写 | 发送组合快捷键 |
 | `ui_screenshot` | 只读 | 截图落盘（全屏 / 区域） |
 | `ui_ocr` | 只读 | 屏幕 OCR（blocks / keyword / text） |

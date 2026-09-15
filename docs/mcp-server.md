@@ -75,6 +75,7 @@ $env:PYTHONUTF8=1
 | `UI_AGENT_CALL_TIMEOUT` | `120` | 单次内核调用超时（秒），超时返回 `ok=false` 错误对象 |
 | `UI_AGENT_SEARCH_TIMEOUT` | `2.0` | UIA 元素查找超时（秒） |
 | `UI_AGENT_OUTPUT_DIR` | 系统临时目录下 `ui-agent\shots` | `ui_screenshot` 不传 `path` 时的落盘目录 |
+| `UIAGENT_CTX_TTL` | `30`（秒） | **P0 `AppContext` 缓存 TTL**：缓存 `app → {hwnd, bounds, title, process_name, state}` 这条"窗口线索"，供 `ui_find` / `ui_click` 的 `scope=auto` 搜索域复用、`ui_activate_window` / `ui_app_ensure` 的 hwnd 快捷定位使用（避免每次退化为桌面级全树搜索）。`0` = **完全关闭**（不读不写，定位每次重新枚举，P0 提速收益回退）。进程启动时读取一次，改后需**重启 MCP 服务**生效；单次调用可用 `ui_find` / `ui_click` 的 `reuse_ttl` 覆盖（`0` = 本次不读不写，上限 600 s）。**该缓存只缓存"窗口线索"，不缓存状态：`ui_app_status` 的 `state` 每次调用实时推导，不受此变量影响**（详见《输入法与焦点调用约定》第四节） |
 | `UIAGENT_ENSURE_V2` | `1` | 应用唤起回退开关（P1）：`1` 走「状态判定 S1~S4 → 唤醒 / 置前 → 就绪确认」新链路；`0` 时 `ui_app_ensure` 退化为 `find_window` + `activate_window` 旧链路（命中窗口时 `state="unknown"`、不做 bounds 稳定等待，`timing` 仅 `snapshot_ms` / `total_ms`；未命中同样返回 `state="not_running"` 但不带 `candidates`），用于线上快速回滚 |
 | `UIAGENT_LAUNCH_ENABLED` | `1` | **P2 启动能力总开关**：`0` 时 `ui_launch_app` 整条链路直接拒绝（含 `dry_run`），返回 `ok=false` + `degraded_reason="launch_disabled"`，且不产生任何进程；用于线上快速关闭"启动未运行应用"这一高风险能力 |
 | `UIAGENT_LAUNCH_ALLOWLIST` | 未设置 → **内置默认白名单**（安全默认） | **P2 启动白名单**（逗号分隔，匹配应用别名 / exe 名 / 目标文件名，大小写不敏感）。三种取值语义：①**未设置 / 空白** → 套用内置默认白名单 `DEFAULT_LAUNCH_ALLOWLIST`（常用应用：记事本、计算器、画图、资源管理器、Edge、微信；**刻意不含** `cmd` / `powershell` / `pwsh` / 终端 / `taskmgr` / `regedit` 等命令解释器与系统管理工具）；②**显式配置**（非空）→ **以配置为准**，整体替换默认白名单（可放开默认之外的入口，如 `weixin.exe,微信,msedge.exe,notepad.exe`）；③**显式设为 `*` 或 `all`** → 不校验（显式解除限制入口，需人为设置）。校验不通过时返回 `ok=false` + `degraded_reason="not_allowlisted"`（`error`/`hint` 会标注是「内置默认白名单」还是「env 显式配置」拒绝，并给出放开方式），并落审计告警 |
@@ -118,8 +119,8 @@ $env:PYTHONUTF8=1
 | `ui_wait_window` | 只读 | **P2 新增**：等待目标窗口出现并完成布局（`hwnd` > `pid` > `app` 三选一定位），替代上层"睡眠 + 反复查询"的轮询往返；超时返回 `state="launching"`（非错误） |
 | `ui_find` | 只读 | 定位元素或界面文字（UIA 优先 → OCR 兜底），返回坐标与来源 |
 | `ui_click` | 写 | 点击目标：`target` 定位式点击，或直接给 `x`/`y` 坐标；被置顶窗口遮挡时自动临时抬升目标窗口 |
-| `ui_type` | 写 | 向焦点处输入文本（中文自动改走剪贴板） |
-| `ui_hotkey` | 写 | 发送组合快捷键，如 `ctrl+s`、`alt+f4` |
+| `ui_type` | 写 | 向焦点处输入文本（**含非 ASCII 自动改走剪贴板；纯 ASCII 串走键盘注入，中文输入法激活时会被拦截**——见《输入法与焦点调用约定》第一节） |
+| `ui_hotkey` | 写 | 发送组合快捷键，如 `ctrl+s`、`alt+f4`（发给**当前前台窗口**的焦点控件，调用前需先取前台焦点） |
 | `ui_screenshot` | 只读 | 截屏（全屏或指定区域）并保存为图片文件 |
 | `ui_ocr` | 只读 | 屏幕 OCR：文本块清单 / 关键词命中坐标 / 整屏文本 |
 
@@ -333,7 +334,17 @@ $env:PYTHONUTF8=1
 | `interval` | float | `0.02` | 逐字符间隔（仅键盘模式） |
 | `method` | str | `auto` | `auto` / `keystroke` / `clipboard` |
 
-返回：`ok / chars / method / elapsed_seconds`。**调用前需确保目标输入框已获焦**（可先 `ui_click`）。
+返回：`ok / chars / method / elapsed_seconds`。**调用前需确保目标输入框已获焦**（可先 `ui_click`，或先 `ui_activate_window` / `ui_app_ensure(require_foreground=true)` 取前台焦点）。
+
+`method` 语义与文本形态的对应关系（**整串级**分流，`auto` 即内核默认）：
+
+| `method` | 实际路径 | 适用 |
+| --- | --- | --- |
+| `auto`（默认） | 串中含任一非 ASCII 字符 → **剪贴板粘贴**（`pyperclip` + `ctrl+v`）；**全 ASCII 串 → 键盘逐字符注入**（`pyautogui.typewrite`） | 常规调用 |
+| `clipboard` | 强制剪贴板粘贴 | **需要精确落字的文本（尤其含 ASCII 字母 / 数字、中英混合串）建议显式指定**；不受输入法状态影响，但会覆盖系统剪贴板 |
+| `keystroke` | 强制键盘注入 | 目标控件拒绝粘贴时使用；**必须先切换 / 关闭中文输入法**，否则纯 ASCII 串会被 IME 组字拦截（实测 `a1b2c3` → `啊靶场`） |
+
+> 返回值中的 `chars` 是**发出字符数**，不代表目标控件已正确落字；关键链路请回读校验（记事本可回读磁盘文件，或 `ui_find` / `ui_ocr` 复核文本）。约定细节见《输入法与焦点调用约定》。
 
 ### 4.10 `ui_hotkey`
 
@@ -343,6 +354,8 @@ $env:PYTHONUTF8=1
 | `delay` | float | `0` | 发送前等待秒数 |
 
 返回：`ok / keys[] / sent_at`。
+
+> **按键发给"当前前台窗口的焦点控件"，本工具不负责置焦**：`ctrl+s` / `alt+f4` 这类写操作前，先用 `ui_activate_window(hwnd=…)` 或 `ui_app_ensure(app=…, require_foreground=true)` 取得前台焦点并复核返回的 `activated` / `state`（`degraded_reason="foreground_locked"` 表示窗口已唤醒但未占前台，此时发键可能落到其它窗口）。`ok=true` 仅表示按键已发出，**保存 / 关闭的实际结果必须用 ground truth 校验**（详见《输入法与焦点调用约定》第二、三节）。
 
 ### 4.11 `ui_screenshot`
 
@@ -474,6 +487,10 @@ P2 启动安全闸验证（零进程断言，逐项比对 `tasklist` 前后快�
 | 串行执行 | 所有调用经同一 COM 线程排队；长耗时 OCR 会阻塞后续调用 |
 | OCR 性能 | 全屏 2560×1440 单次约 2–3 s；建议传 `region` 裁剪，或先走 `ui_find` 的 UIA 通道 |
 | 输入前置条件 | `ui_type` 不负责置焦，需先 `ui_click` 或 `ui_activate_window` |
+| 输入法吞字（新增） | `ui_type` 的 `auto` 分流是**整串级**：含中文 → 剪贴板，**纯 ASCII 串 → 键盘注入**，中文输入法激活时会被 IME 组字 / 候选拦截，导致吞字、串码（实测 `a1b2c3` → `啊靶场`、`bench-11-ok` → `bench-1-ok`）；需要精确落字时显式 `method="clipboard"`，或先切英文输入法。详见 §7.1 |
+| 键盘写操作须先取前台焦点（新增） | `ui_type` / `ui_hotkey` 把按键发给**当前前台窗口的焦点控件**，二者都不置焦；`ctrl+s` / `alt+f4` 前先用 `ui_activate_window(hwnd=…)` 或 `ui_app_ensure(app=…, require_foreground=true)`，并复核 `activated` / `state`（`degraded_reason="foreground_locked"` = 已唤醒但未占前台，发键有落错窗口风险）。详见 §7.1 |
+| 保存 / 关闭须用 ground truth 校验（新增） | `ui_hotkey` 的 `ok=true` **只代表按键已发出**：`ctrl+s` 后必须回读磁盘（内容 / `mtime`）确认落盘（无路径文档会弹「另存为」）；`alt+f4` 前先保存（有未保存修改会弹确认框阻塞关闭），关闭成功以 **`hwnd` 消失**为准（`ui_window_list(include_invisible=true)` 中不再出现该 `hwnd`，等价 `user32.IsWindow(hwnd)==false`）。详见 §7.1 |
+| 应用状态口径（新增） | `ui_app_status` 的 `state` 取该应用**最优候选窗口**（`select_best_window`：可见未最小化 > 可见已最小化 > 隐藏，同档取面积大者，且先剔除托盘 / 消息类 helper 窗口），**不是**你正在操作的那个窗口：多窗口应用隐藏其中一个后应用级 `state` 仍可能为 `visible`（**口径使然，并非缓存陈旧**）。判特定窗口请按 `hwnd` 查 `candidates[].state`，或用 `ui_window_list(include_invisible=true)`；`cached` / `cached_hwnd` / `cached_age_ms` 来自 `AppContext` 缓存（`UIAGENT_CTX_TTL`，默认 30 s），属**历史线索，不得用于状态 / 关闭裁决**。详见 §7.1 |
 | 写操作副作用 | 鼠标 / 键盘 / 剪贴板为真实操作，会改变用户桌面状态；`ui_type` 的剪贴板模式会覆盖剪贴板内容 |
 | 安全边界 | `ui_screenshot` 拒绝写入 `C:\Windows`、`Program Files*`、`C:\ProgramData` |
 | 应用兼容性 | 游戏、远程桌面、Canvas 自绘界面无法 UIA 定位，只能依赖 OCR |
@@ -488,6 +505,58 @@ P2 启动安全闸验证（零进程断言，逐项比对 `tasklist` 前后快�
 | 启动超时语义（RF7） | `ui_launch_app` / `ui_wait_window` 超时返回 `state="launching"`（非错误）；`timeout` 缺省按分级 `light` 8 s / `normal` 15 s / `heavy` 25 s，是「放弃等待」上限，**不是 SLA 目标值** |
 | 回退开关（P1） | `UIAGENT_ENSURE_V2=0` 时 `ui_app_ensure` 退回 `find_window` + `activate_window` 旧链路（`fallback="legacy"`）：命中窗口返回 `state="unknown"` 且不判四状态；未命中返回 `state="not_running"` 且无 `candidates`；`timing` 仅 `snapshot_ms` / `total_ms` |
 | 回退开关（P2） | `UIAGENT_LAUNCH_ENABLED=0` 一键禁用启动能力，S4 回到改造前「空白态」（`not_running` + 提示人工启动），其余工具不受影响；`UIAGENT_LAUNCH_ALLOWLIST` 显式配置即覆盖内置默认白名单（需放开默认之外的入口时使用），显式设为 `*` / `all` 即解除白名单限制（不校验） |
+
+### 7.1 输入法与焦点调用约定（新增）
+
+> 来源：2026-09-15 端到端提速验证暴露的三类**宿主侧**缺陷——输入法吞字、键盘写操作未取前台焦点、保存 / 关闭只看 `ok=true` 不校验结果。**内核未做任何改动**，以下规避手段全部在调用方；对 CowAgent / Marvis / 其它 MCP 客户端一律适用。
+
+#### 一、输入文本（`ui_type`）
+
+`ui_type` 的分流是**整串级**的：串中含任一非 ASCII 字符 → **剪贴板粘贴**；**全 ASCII 串 → 键盘逐字符注入**（`pyautogui.typewrite`，走扫描码）。因此：
+
+| 文本形态 | `auto`（默认）实际路径 | 风险 |
+| --- | --- | --- |
+| 纯中文 / 中含中文 | 剪贴板 | 无（但会覆盖剪贴板） |
+| 纯 ASCII（`a1b2c3`、`bench-11-ok`） | **键盘注入** | **中文输入法激活时被 IME 拦截**：组字 / 候选导致吞字、串码（实测 `a1b2c3` → `啊靶场`、`bench-11-ok` → `bench-1-ok`；纯数字串通常不受影响） |
+
+约定：
+
+1. **需要精确落字的文本（尤其含 ASCII 字母 / 数字，或中英混合串）一律显式 `method="clipboard"`**，不要依赖 `auto` 的分流。
+2. 必须走键盘注入时（`method="keystroke"`，如目标控件拒绝粘贴）：**先关闭或切换到英文输入法**（如 `ui_hotkey("shift")` 切中英、`ui_hotkey("win+space")` 切输入法），输入完成后再切回。
+3. 剪贴板模式会**覆盖系统剪贴板**，内核**不做备份 / 恢复**；剪贴板内有重要内容时请自行先备份。
+4. 输入后**回读校验**：`ui_type` 只返回 `chars`（发出字符数），不代表目标控件已正确落字。关键链路应回读（记事本可读磁盘文件，或用 `ui_find` / `ui_ocr` 复核）。
+
+#### 二、焦点（键盘类写操作前必须先取前台焦点）
+
+`ui_type` / `ui_hotkey` 把按键发给**当前前台窗口的焦点控件**，二者都不负责置焦：
+
+1. 键盘写操作前先置前：`ui_activate_window(hwnd=…)` **或** `ui_app_ensure(app=… / hwnd=…, require_foreground=true)`（缺省即为 `true`）。
+2. 复核置前结果：`ui_activate_window` 看 `activated` / `state` / `covered`；`ui_app_ensure` 看 `state` / `ready`。`degraded_reason="foreground_locked"` 表示**窗口已唤醒但未占前台**（系统前台锁定策略），此时直接发键可能落到其它窗口——应改用 `ui_click` 先点进目标控件再输入。
+3. 需要点进具体输入框时用 `ui_click(target=…, app=…)`：一次调用内完成「置前 → 窗口内定位 → 点击」。
+4. 定位类调用（`ui_find` / `ui_click`）建议**始终带 `app` 或 `hwnd`**：窗口限定定位通常 <15 ms，桌面级全树遍历约 484 ms，且能保证操作落在目标窗口。
+
+#### 三、保存与关闭（结果必须用 ground truth 校验）
+
+| 场景 | 约定 |
+| --- | --- |
+| `ctrl+s` 保存 | ①先按第二节取前台焦点；②`ui_hotkey` 的 `ok=true` **只说明按键已发出**；③必须**回读磁盘**（文件内容 / `mtime`）确认落盘；④无路径的新文档 `ctrl+s` 会弹「另存为」对话框，需在对话框内完成才真正落盘 |
+| `alt+f4` 关闭 | ①先取前台焦点；②**有未保存修改时会弹保存确认框阻塞关闭**，应先保存再关闭；③**不得仅凭 `ok=true` 或历史状态值判定关闭成功**，必须以 `hwnd` 消失为准 |
+
+关闭成功的判据（二选一，等价）：
+
+- `ui_window_list(include_invisible=true)` 返回的 `windows[]` / `hidden_windows[]` 中**不再出现该 `hwnd`**；
+- 调用方自行用 `ctypes` 直读 `user32.IsWindow(hwnd) == false`（隐藏 / 前台态可另用 `IsWindowVisible(hwnd)`、`GetForegroundWindow() == hwnd`）。
+
+> 建议关闭后等 200~500 ms 再复核一次（`alt+f4` → 进程退出 → 窗口销毁存在毫秒级延迟）。
+
+#### 四、应用状态口径与 `AppContext` 缓存（`UIAGENT_CTX_TTL`）
+
+1. **`state` 是"应用最优窗口"口径**：`ui_app_status` / `ui_app_ensure` 的 `state` 由 `select_best_window` 选出的最优候选窗口推导（可见未最小化 > 可见已最小化 > 隐藏，同档取面积大者，且先剔除托盘 / 消息类 helper 窗口），**不是**调用方正在操作的那个窗口。多窗口应用（微信 / Qt、浏览器多窗口）隐藏其中一个窗口后，应用级 `state` 仍可能为 `visible`——**这是口径使然，不是缓存陈旧**。
+   - 判断某个特定窗口：读 `ui_app_status(apps=[…])` 的 `candidates[].state`（按 `hwnd` 匹配），或用 `ui_window_list(include_invisible=true)` 取该 `hwnd` 的 `state` / `visible` / `iconic`。
+2. **缓存只缓存"窗口线索"，不缓存状态**：`cached` / `cached_hwnd` / `cached_age_ms`（`ui_app_status`）与 `cached`（`ui_app_ensure` / `ui_find` / `ui_click`）来自 `AppContext`——它只记录 `app → hwnd / bounds / title / process_name` 这条线索（消费方只有四处：`ui_find` / `ui_click` 的搜索域复用、`ui_app_ensure` 的 `hwnd` 快捷定位、`ui_app_status` 的 `cached` 标注；`ui_activate_window` 不读缓存）；命中前内核会用 `IsWindow` 校验 `hwnd` 是否仍有效，失效即清除。
+   - **`state` 每次调用都由实时枚举推导**（Win32 `EnumWindows` + `IsWindowVisible` / `IsIconic` / cloaked 位），不经过该缓存；缓存条目的 `state` 字段固定写 `"ready"`（仅表示"该 hwnd 是可用线索"），**内核从不把缓存里的状态回填给调用方**。因此 **`UIAGENT_CTX_TTL` 无法改变状态新鲜度**，把状态误判归因于该缓存是不成立的。
+   - `cached_hwnd` 属**历史线索**，不得用于状态裁决 / 关闭判定。如需彻底消除该字段，可设 `UIAGENT_CTX_TTL=0`（代价：`ui_find` / `ui_click` 失去窗口搜索域复用、`ui_app_ensure` 每次重新枚举候选，P0 提速收益回退）；只想在个别调用上关闭缓存时，用 `ui_find` / `ui_click` 的 `reuse_ttl=0`。
+3. 内核**不提供**"状态刷新"类开关（不存在可关掉的"状态缓存"），因此**没有必要为规避状态陈旧而调整任何环境变量**；正确的做法是按第 1 条改用 `hwnd` 级别的判据。
 
 ### 故障排查
 
@@ -507,4 +576,7 @@ P2 启动安全闸验证（零进程断言，逐项比对 `tasklist` 前后快�
 | `ui_launch_app` 返回 `state="launching"` | 等待窗口超时（`degraded_reason=launch_timeout`），进程已发起：可再调 `ui_wait_window(pid=<返回的 pid>, app=…)` 继续等，或稍后 `ui_app_status` 复核；**不要**当作失败重试启动 |
 | `ui_launch_app` / `ui_wait_window` 一直等不到窗口 | 若 `ok=false` 且带 `hint`，说明解析链未命中（Win 键搜索兜底未实现）——改用绝对路径（如 `C:/Program Files/.../app.exe`）或把应用加入 `apps.yaml` 别名表；若 `ok=true` 但 `state` 非预期，用 `ui_window_list(include_invisible=true)` 按 `pid` 查真实窗口 |
 | `ui_launch_app` 返回多个 `candidates` | 解析歧义（如同名快捷方式），按 RF5 **不会自动启动**；请用 `candidates[].target_path` 指定绝对路径，或先冻结该别名 |
+| `ui_type` 输入的字符与预期不符（吞字 / 串码 / 变成中文） | 中文输入法拦截了纯 ASCII 串的键盘注入（`auto` 对全 ASCII 串走 `typewrite`）：改用 `ui_type(method="clipboard")`，或先切英文输入法后重输；详见 §7.1 |
+| `ui_hotkey("ctrl+s")` 未保存 / `ui_hotkey("alt+f4")` 未关闭 | 按键落到非目标窗口或未保存对话框阻塞：先 `ui_activate_window` / `ui_app_ensure(require_foreground=true)` 取前台焦点再发键；保存后回读磁盘（内容 / `mtime`），关闭后按该 `hwnd` 是否消失复核（详见 §7.1） |
+| `ui_app_status` 报 `visible` 但看不到目标窗口 | 该 `state` 是"应用**最优窗口**"口径，可能指向同应用的另一个窗口：按 `hwnd` 查 `candidates[].state`，或用 `ui_window_list(include_invisible=true)` 取真实窗口态；`cached_hwnd` 只是历史线索，不用于裁决（详见 §7.1 第四节） |
 *（内容由AI生成，仅供参考）*

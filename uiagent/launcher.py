@@ -18,7 +18,10 @@
 安全约束（方案 RF5 / RF6）
 --------------------------
 1. ``UIAGENT_LAUNCH_ENABLED=0`` 时 ``launch()`` 直接拒绝，回到「仅能操作已运行应用」；
-2. ``UIAGENT_LAUNCH_ALLOWLIST`` 非空时严格校验（别名 / 进程名 / 目标可执行文件名任一命中）；
+2. ``UIAGENT_LAUNCH_ALLOWLIST`` **默认启用安全白名单**：未设置或为空时套用内置默认白名单
+   （:data:`DEFAULT_LAUNCH_ALLOWLIST`，只含常用应用，**不含** ``cmd`` / ``powershell`` / 终端等
+   命令解释器与系统管理工具）；环境变量显式配置时**以配置为准**；显式设为 ``*`` / ``all``
+   表示不校验（显式解除限制入口）。命中判定 = 别名 / 进程名 / 目标可执行文件名任一命中，大小写不敏感；
 3. 解析出多个候选时**不自动选择**，返回 ``candidates`` 与 ``degraded_reason="ambiguous_candidates"``；
 4. ``dry_run=True`` 只解析不启动，不产生任何进程；
 5. ``wait_window()`` 超时返回 ``state="launching"``（非异常）。
@@ -50,6 +53,28 @@ DEFAULT_APPS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ap
 #: 环境变量（改动点 #16）
 LAUNCH_ENABLED_ENV = "UIAGENT_LAUNCH_ENABLED"
 LAUNCH_ALLOWLIST_ENV = "UIAGENT_LAUNCH_ALLOWLIST"
+
+#: 内置默认白名单（安全默认）：``UIAGENT_LAUNCH_ALLOWLIST`` 未设置或为空时生效。
+#: 只含常用无害应用，**刻意不含** ``cmd`` / ``powershell`` / ``pwsh`` / ``wt``（Windows 终端）/
+#: ``taskmgr`` / ``regedit`` 等命令解释器与系统管理工具——这类入口等价于「任意命令执行」，
+#: 需要时必须由调用方在 env 中显式配置。
+DEFAULT_LAUNCH_ALLOWLIST: Tuple[str, ...] = (
+    "notepad.exe",
+    "记事本",
+    "calc.exe",
+    "计算器",
+    "mspaint.exe",
+    "画图",
+    "explorer.exe",
+    "资源管理器",
+    "文件资源管理器",
+    "msedge.exe",
+    "weixin.exe",
+    "微信",
+)
+
+#: 显式解除白名单限制的取值（``UIAGENT_LAUNCH_ALLOWLIST`` 设为其中之一 → 不校验）
+ALLOWLIST_UNRESTRICTED_TOKENS: Tuple[str, ...] = ("*", "all")
 
 #: 冷启动分级默认超时（方案 4.2（2）：轻量 ≤1.5 s / 常规 ≤8 s / 重量 ≤20 s 为目标值，
 #: 这里的 timeout 是「放弃等待」的宽松上限，超时返回 state=launching 而非失败）
@@ -150,10 +175,44 @@ def launch_enabled() -> bool:
     return _flag(LAUNCH_ENABLED_ENV, "1")
 
 
-def launch_allowlist() -> Tuple[str, ...]:
-    """启动白名单（``UIAGENT_LAUNCH_ALLOWLIST``，逗号分隔）。空 = 不校验。"""
+def launch_allowlist_raw() -> Tuple[str, ...]:
+    """解析 ``UIAGENT_LAUNCH_ALLOWLIST`` 原值（逗号分隔；未设置 / 空 → 空元组）。
+
+    仅做归一化（去空白、转小写），**不套用默认值**，供「是否显式配置」判定使用。
+    """
     raw = str(os.environ.get(LAUNCH_ALLOWLIST_ENV, "") or "")
     return tuple(item.strip().lower() for item in raw.split(",") if item.strip())
+
+
+def launch_allowlist_config() -> Dict[str, Any]:
+    """计算**生效**白名单配置（安全默认化的唯一入口）。
+
+    :return: ``{"items": 生效条目, "source": "default" | "env" | "unrestricted",
+        "unrestricted": bool, "explicit": bool}``
+
+    语义：
+
+    * env 未设置 / 空白 → ``source="default"``，套用 :data:`DEFAULT_LAUNCH_ALLOWLIST`；
+    * env 显式配置（非空） → ``source="env"``，**以配置为准**（可放开默认白名单之外的常用应用）；
+    * env 显式设为 ``*`` / ``all`` → ``unrestricted=True``，不校验（解除限制入口，需显式操作）。
+    """
+    items = launch_allowlist_raw()
+    explicit = bool(items)
+    if not explicit:
+        return {
+            "items": tuple(DEFAULT_LAUNCH_ALLOWLIST),
+            "source": "default",
+            "unrestricted": False,
+            "explicit": False,
+        }
+    if any(item in ALLOWLIST_UNRESTRICTED_TOKENS for item in items):
+        return {"items": (), "source": "unrestricted", "unrestricted": True, "explicit": True}
+    return {"items": items, "source": "env", "unrestricted": False, "explicit": True}
+
+
+def launch_allowlist() -> Tuple[str, ...]:
+    """生效白名单条目（解除限制时为 ``()``）。"""
+    return tuple(launch_allowlist_config()["items"])
 
 
 def _normalize(value: Any) -> str:
@@ -605,10 +664,15 @@ class AppLauncher:
 
     # ------------------------------------------------------------ 白名单校验
     def allowlist_check(self, app: Any, resolved: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """校验白名单（``UIAGENT_LAUNCH_ALLOWLIST`` 非空时严格匹配）。"""
-        allow = launch_allowlist()
-        if not allow:
-            return {"ok": True, "checked": False, "allowlist": []}
+        """校验白名单（**默认启用**：未配置 env 时套用内置默认白名单）。
+
+        :return: ``{"ok", "checked", "allowlist", "tokens"?, "source"}``；``source`` ∈
+            ``default``（内置默认生效）/ ``env``（env 显式配置）/ ``unrestricted``（显式解除限制）。
+        """
+        config = launch_allowlist_config()
+        if config["unrestricted"]:
+            return {"ok": True, "checked": False, "allowlist": [], "source": "unrestricted"}
+        allow = tuple(config["items"])
         tokens = {
             _normalize(app),
             _stem(app),
@@ -625,6 +689,7 @@ class AppLauncher:
             "checked": True,
             "allowlist": list(allow),
             "tokens": sorted(tokens),
+            "source": str(config["source"]),
         }
 
     # ------------------------------------------------------------ 启动
@@ -645,7 +710,9 @@ class AppLauncher:
         :param method: ``auto`` / ``exec``（ShellExecuteEx）/ ``process``（CreateProcess）/ ``uwp``
         :param timeout: 等待窗口就绪的超时（缺省按应用分级，见 :data:`TIER_TIMEOUTS`）
         :return: ``{"ok", "app", "resolved_by", "target_path", "pid", "hwnd", "launch_ms",
-            "wait_ms", "state", "degraded", "degraded_reason", "candidates", "dry_run", "hint"}``
+            "wait_ms", "state", "degraded", "degraded_reason", "candidates", "dry_run", "hint",
+            "allowlist", "allowlist_source", "allowlist_checked"}``（``allowlist_source`` ∈
+            ``default`` / ``env`` / ``unrestricted``，便于审计白名单来源）
         """
         from .audit import get_audit_logger
 
@@ -673,6 +740,9 @@ class AppLauncher:
             "candidates": resolved.get("candidates") or [],
             "elapsed_ms": 0.0,
             "hint": "",
+            "allowlist": list(launch_allowlist()),
+            "allowlist_source": str(launch_allowlist_config()["source"]),
+            "allowlist_checked": False,
         }
 
         def _finish(ok: bool, state: str, reason: str = "", error: str = "") -> Dict[str, Any]:
@@ -724,15 +794,24 @@ class AppLauncher:
         # ③ 白名单（RF6）
         allowed = self.allowlist_check(app, resolved.get("candidates", [None])[0] if resolved.get("candidates") else None)
         if not allowed["ok"]:
+            source_label = "内置默认白名单" if allowed.get("source") == "default" else f"{LAUNCH_ALLOWLIST_ENV} 显式配置"
+            payload["hint"] = (
+                f"目标不在{source_label}内。如需放开：设置 {LAUNCH_ALLOWLIST_ENV}"
+                "（逗号分隔，别名 / exe 名，如 notepad.exe,记事本）覆盖默认白名单；"
+                f"设为 {' / '.join(ALLOWLIST_UNRESTRICTED_TOKENS)} 表示不校验（显式解除限制）。"
+            )
             return _finish(
                 False,
                 "not_running",
                 "not_allowlisted",
-                f"app={app!r} 不在启动白名单内（{LAUNCH_ALLOWLIST_ENV}）：{allowed['allowlist']}",
+                f"app={app!r} 不在{source_label}内：{allowed['allowlist']}",
             )
         target = str(resolved.get("target_path") or "")
         appid = str(resolved.get("appid") or "")
         merged_args = str(args or resolved.get("args") or "")
+        payload["allowlist"] = list(allowed.get("allowlist") or [])
+        payload["allowlist_source"] = str(allowed.get("source") or "")
+        payload["allowlist_checked"] = bool(allowed.get("checked"))
 
         # ④ dry_run：只解析不启动
         if dry_run:

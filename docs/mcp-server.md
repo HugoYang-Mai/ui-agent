@@ -77,7 +77,7 @@ $env:PYTHONUTF8=1
 | `UI_AGENT_OUTPUT_DIR` | 系统临时目录下 `ui-agent\shots` | `ui_screenshot` 不传 `path` 时的落盘目录 |
 | `UIAGENT_ENSURE_V2` | `1` | 应用唤起回退开关（P1）：`1` 走「状态判定 S1~S4 → 唤醒 / 置前 → 就绪确认」新链路；`0` 时 `ui_app_ensure` 退化为 `find_window` + `activate_window` 旧链路（命中窗口时 `state="unknown"`、不做 bounds 稳定等待，`timing` 仅 `snapshot_ms` / `total_ms`；未命中同样返回 `state="not_running"` 但不带 `candidates`），用于线上快速回滚 |
 | `UIAGENT_LAUNCH_ENABLED` | `1` | **P2 启动能力总开关**：`0` 时 `ui_launch_app` 整条链路直接拒绝（含 `dry_run`），返回 `ok=false` + `degraded_reason="launch_disabled"`，且不产生任何进程；用于线上快速关闭"启动未运行应用"这一高风险能力 |
-| `UIAGENT_LAUNCH_ALLOWLIST` | 空 | **P2 启动白名单**（逗号分隔，匹配应用别名 / exe 名，大小写不敏感）：留空 = 不校验（仅受 `UIAGENT_LAUNCH_ENABLED` 约束）；非空 = 严格校验，不匹配时返回 `degraded_reason="not_allowlisted"` 并拒绝启动 |
+| `UIAGENT_LAUNCH_ALLOWLIST` | 未设置 → **内置默认白名单**（安全默认） | **P2 启动白名单**（逗号分隔，匹配应用别名 / exe 名 / 目标文件名，大小写不敏感）。三种取值语义：①**未设置 / 空白** → 套用内置默认白名单 `DEFAULT_LAUNCH_ALLOWLIST`（常用应用：记事本、计算器、画图、资源管理器、Edge、微信；**刻意不含** `cmd` / `powershell` / `pwsh` / 终端 / `taskmgr` / `regedit` 等命令解释器与系统管理工具）；②**显式配置**（非空）→ **以配置为准**，整体替换默认白名单（可放开默认之外的入口，如 `weixin.exe,微信,msedge.exe,notepad.exe`）；③**显式设为 `*` 或 `all`** → 不校验（显式解除限制入口，需人为设置）。校验不通过时返回 `ok=false` + `degraded_reason="not_allowlisted"`（`error`/`hint` 会标注是「内置默认白名单」还是「env 显式配置」拒绝，并给出放开方式），并落审计告警 |
 
 ---
 
@@ -248,7 +248,7 @@ $env:PYTHONUTF8=1
 | `wait_detail` | 就绪等待明细：`matched_by`（`hwnd` / `pid` / `app` / `app_fallback`）、`matched_key`、`fallback`、`polls`、`stable`、`state`、`title`、`process_name` |
 | `degraded_reason` | `launch_disabled`（开关关闭；含 `dry_run` 路径）/ `not_allowlisted`（白名单拒绝）/ `launch_failed`（发起失败）/ `launch_timeout`（等待超时）/ `pid_window_missing`（`pid` 未匹配到窗口，已回退别名键命中，`wait_detail.fallback=true`） |
 
-安全语义（RF6）：`UIAGENT_LAUNCH_ENABLED=0` 时**任何**调用（含 `dry_run`）直接拒绝、不产生进程，并落审计 `launch` 事件；`UIAGENT_LAUNCH_ALLOWLIST` 非空时按别名 / 目标文件名严格校验（大小写不敏感），非白名单启动尝试 = 审计告警；解析歧义（多候选）与打包应用窗口（多数归 `ApplicationFrameHost.exe`，仅按 `pid` 匹配不到）分别由「不自动选择」与 `app_fallback` 兜底键处理。
+安全语义（RF6）：`UIAGENT_LAUNCH_ENABLED=0` 时**任何**调用（含 `dry_run`）直接拒绝、不产生进程，并落审计 `launch` 事件；`UIAGENT_LAUNCH_ALLOWLIST` **默认启用安全白名单**——未设置 / 空白时套用内置默认白名单（常用应用，不含 `cmd` / `powershell` / 终端等命令解释器），显式配置时以配置为准，显式设为 `*` / `all` 表示不校验；校验按别名 / 目标文件名匹配（大小写不敏感），非白名单启动尝试 = 审计告警；解析歧义（多候选）与打包应用窗口（多数归 `ApplicationFrameHost.exe`，仅按 `pid` 匹配不到）分别由「不自动选择」与 `app_fallback` 兜底键处理。
 
 ### 4.5 `ui_wait_window`（P2 新增）
 
@@ -379,7 +379,7 @@ $env:PYTHONUTF8=1
 - 只读工具可任意调用；写工具（`ui_activate_window` / `ui_app_ensure` / `ui_launch_app` / `ui_click` / `ui_type` / `ui_hotkey`）会真实操控桌面，**调用方 Agent 需自行做安全确认**。其中 `ui_launch_app` 属**高风险**（真实创建进程），启用前建议先跑 `dry_run=true` 预演解析结果。
 - **降级 ≠ 失败**：`ui_app_ensure` 的 `degraded=true` 只表示未达到最优就绪状态（`degraded_reason` ∈ `foreground_locked` / `window_unstable` / `app_window_cloaked` / `timeout`），返回体仍带可用的 `hwnd` / `state` / `window`，调用方可继续按 `hwnd` 操作。
 - **启动链路的三态而非二态**：`ui_launch_app` 的 `state="launching"`（等待窗口超时，`degraded_reason="launch_timeout"`）与 `ui_wait_window` 的超时同义——进程已发起、窗口只是还没就绪，**不是错误**，上层可继续 `ui_wait_window` 轮询或稍后 `ui_app_status` 复核（RF7）。
-- **启动被拒也是结构化返回**：`UIAGENT_LAUNCH_ENABLED=0` → `ok=false` + `degraded_reason="launch_disabled"`（含 `dry_run`）；白名单不匹配 → `degraded_reason="not_allowlisted"`；两者均不产生任何进程，且同样落审计 `launch` 事件（RF6）。
+- **启动被拒也是结构化返回**：`UIAGENT_LAUNCH_ENABLED=0` → `ok=false` + `degraded_reason="launch_disabled"`（含 `dry_run`）；白名单不匹配（默认白名单或 env 显式配置一视同仁，`hint` 标注来源与放开方式）→ `degraded_reason="not_allowlisted"`；两者均不产生任何进程，且同样落审计 `launch` 事件（RF6）。
 - 应用未运行时 `ui_app_ensure` 返回 `ok=false` + `state="not_running"` + `candidates`：`launch_if_missing=false`（默认）**不启动进程**（`degraded_reason="app_not_running"`）；`launch_if_missing=true` 时转交 P2 启动链路自动冷启动，成功则回填 `timing.launch_ms`（为窗口就绪等待耗时 `wait_ms`），失败或开关 / 白名单拒绝时 `degraded_reason` 为 `launch_disabled` / `not_allowlisted` / `launch_failed`。
 
 ---
@@ -457,6 +457,10 @@ P2 启动安全闸验证（零进程断言，逐项比对 `tasklist` 前后快�
 | 白名单不匹配 + 真实启动请求 | `UIAGENT_LAUNCH_ALLOWLIST=notepad.exe`，请求 `计算器` | `ok=false`、`degraded_reason=not_allowlisted`、**无进程**（1.7 ms） |
 | 白名单匹配 → 放行 | `ALLOWLIST=notepad.exe`，请求 `记事本` | `ok=true`、`state=dry_run`（预演） |
 | 白名单大小写不敏感 | `ALLOWLIST=NOTEPAD`，请求 `notepad.exe` | `ok=true`、`state=dry_run`（误拒为 0） |
+| 默认白名单生效（未配置 env） | 不设 `UIAGENT_LAUNCH_ALLOWLIST`，请求 `记事本` | `ok=true`、`state=dry_run`（`allowlist_source=default`） |
+| 默认白名单拦截命令解释器 | 不设 `UIAGENT_LAUNCH_ALLOWLIST`，请求 `cmd` | `ok=false`、`degraded_reason=not_allowlisted`、**无进程**（`hint` 给出放开方式） |
+| 显式配置覆盖默认白名单 | `ALLOWLIST=weixin.exe,微信`，请求 `记事本` | `ok=false`、`degraded_reason=not_allowlisted`（默认条目不再放行） |
+| 显式解除限制入口 | `ALLOWLIST=*`，请求 `cmd`（`dry_run=true`） | `ok=true`、`state=dry_run`（不校验，仅解析） |
 
 退出码：`0` 全部通过，`1` 存在失败检查项。
 
@@ -478,12 +482,12 @@ P2 启动安全闸验证（零进程断言，逐项比对 `tasklist` 前后快�
 | 置顶窗口遮挡 | 置顶窗口（`topmost=true`，如固定最前的微信）会盖住同区域普通窗口：`ui_activate_window` 返回 `covered / covered_by / hint`，`ui_click` 自动临时抬升目标窗口并返回 `auto_raise / hit_window`；也可先用 `ui_window_list` 的 `topmost_windows` 预判遮挡者 |
 | 唤起状态口径（P1） | `state` 由 `visible` + `iconic` + Win32 cloaked 位推导为 `visible` / `minimized` / `hidden` / `cloaked`；`cloaked` 不计入 S1~S3（UWP 挂起或位于其它虚拟桌面，此时坐标操作不可靠） |
 | 启动能力（P2 已具备） | `ui_launch_app` 可真实拉起未运行的应用并等待窗口就绪；`ui_wait_window` 可等已发起的进程窗口（`hwnd` / `pid` / `app` 三线索）。`ui_app_ensure(launch_if_missing=true)` 会转交该链路（等价于「启动 + 四状态唤起」一次调用）。**无独立启动能力时**（`launch_if_missing=false`）仍返回 `state="not_running"` + `candidates`（`degraded_reason="app_not_running"`） |
-| 启动安全闸（RF6） | ①`UIAGENT_LAUNCH_ENABLED=0` → 一切启动调用（含 `dry_run`）拒绝，`degraded_reason="launch_disabled"`；②`UIAGENT_LAUNCH_ALLOWLIST` 非空 → 仅放行白名单（别名 / 目标文件名，大小写不敏感），其余 `not_allowlisted` + 审计告警；③多候选（`ambiguous`）**不自动选择**，返回 `candidates[]` 交上层决策（RF5）。三条拒绝路径均已验证**零进程产生** |
+| 启动安全闸（RF6） | ①`UIAGENT_LAUNCH_ENABLED=0` → 一切启动调用（含 `dry_run`）拒绝，`degraded_reason="launch_disabled"`；②`UIAGENT_LAUNCH_ALLOWLIST` **默认启用安全白名单**（未设置 / 空白 → 内置默认白名单：常用应用，不含 `cmd` / `powershell` / 终端等命令解释器；显式配置 → 以配置为准；显式设为 `*` / `all` → 不校验）→ 仅放行生效白名单（别名 / 目标文件名，大小写不敏感），其余 `not_allowlisted` + 审计告警；③多候选（`ambiguous`）**不自动选择**，返回 `candidates[]` 交上层决策（RF5）。三条拒绝路径均已验证**零进程产生** |
 | 启动解析边界 | 解析链为别名表 → `App Paths` → `PATH` → 开始菜单 → UWP；Win 键搜索兜底**未实现**（`search_fallback` 不返回），未命中即有 `hint` 提示改用绝对路径（RF8 剩余项） |
 | 打包应用窗口归属 | Store 应用（记事本 / 计算器）窗口多由 `ApplicationFrameHost.exe` 承载，按 `pid` 匹配不到窗口，需靠 `app` / 别名键兜底——此时 `matched_by="app_fallback"`、`wait_detail.fallback=true`，是**正常路径**而非降级失败 |
 | 启动超时语义（RF7） | `ui_launch_app` / `ui_wait_window` 超时返回 `state="launching"`（非错误）；`timeout` 缺省按分级 `light` 8 s / `normal` 15 s / `heavy` 25 s，是「放弃等待」上限，**不是 SLA 目标值** |
 | 回退开关（P1） | `UIAGENT_ENSURE_V2=0` 时 `ui_app_ensure` 退回 `find_window` + `activate_window` 旧链路（`fallback="legacy"`）：命中窗口返回 `state="unknown"` 且不判四状态；未命中返回 `state="not_running"` 且无 `candidates`；`timing` 仅 `snapshot_ms` / `total_ms` |
-| 回退开关（P2） | `UIAGENT_LAUNCH_ENABLED=0` 一键禁用启动能力，S4 回到改造前「空白态」（`not_running` + 提示人工启动），其余工具不受影响；`UIAGENT_LAUNCH_ALLOWLIST` 清空即解除白名单限制 |
+| 回退开关（P2） | `UIAGENT_LAUNCH_ENABLED=0` 一键禁用启动能力，S4 回到改造前「空白态」（`not_running` + 提示人工启动），其余工具不受影响；`UIAGENT_LAUNCH_ALLOWLIST` 显式配置即覆盖内置默认白名单（需放开默认之外的入口时使用），显式设为 `*` / `all` 即解除白名单限制（不校验） |
 
 ### 故障排查
 
@@ -499,7 +503,7 @@ P2 启动安全闸验证（零进程断言，逐项比对 `tasklist` 前后快�
 | `ui_app_ensure` 报 `not_running` 但应用明明开着 | 看返回的 `candidates` / `hints`：应用可能只有 `cloaked` 窗口（UWP 挂起或位于其它虚拟桌面）或无主窗口；把 `candidates[].hwnd` 直接传给 `ui_app_ensure(hwnd=…)` / `ui_window_list(include_invisible=true)` 复核 |
 | `ui_app_ensure` 返回 `degraded_reason=foreground_locked` | 系统前台锁定策略（`SetForegroundWindow` 受限）导致未置前——窗口已被唤醒，可继续按 `hwnd` 操作，**不是失败** |
 | `ui_launch_app` 返回 `ok=false` + `launch_disabled` | `UIAGENT_LAUNCH_ENABLED=0` 已禁用启动能力（含 `dry_run`）；需启动能力时设为 `1` 并重启 MCP 服务 |
-| `ui_launch_app` 返回 `ok=false` + `not_allowlisted` | `UIAGENT_LAUNCH_ALLOWLIST` 非空且目标不在白名单；把应用别名或 exe 名（逗号分隔）加入白名单，或清空该变量 |
+| `ui_launch_app` 返回 `ok=false` + `not_allowlisted` | 目标不在生效白名单内：未配置 `UIAGENT_LAUNCH_ALLOWLIST` 时命中的是**内置默认白名单**（常用应用，不含 `cmd` / `powershell` / 终端等命令解释器），如确实需要启动该目标，显式配置该变量把别名或 exe 名（逗号分隔）加入；确需完全不校验时显式设为 `*` / `all`；返回体 `hint` 已标注拒绝来源与放开方式 |
 | `ui_launch_app` 返回 `state="launching"` | 等待窗口超时（`degraded_reason=launch_timeout`），进程已发起：可再调 `ui_wait_window(pid=<返回的 pid>, app=…)` 继续等，或稍后 `ui_app_status` 复核；**不要**当作失败重试启动 |
 | `ui_launch_app` / `ui_wait_window` 一直等不到窗口 | 若 `ok=false` 且带 `hint`，说明解析链未命中（Win 键搜索兜底未实现）——改用绝对路径（如 `C:/Program Files/.../app.exe`）或把应用加入 `apps.yaml` 别名表；若 `ok=true` 但 `state` 非预期，用 `ui_window_list(include_invisible=true)` 按 `pid` 查真实窗口 |
 | `ui_launch_app` 返回多个 `candidates` | 解析歧义（如同名快捷方式），按 RF5 **不会自动启动**；请用 `candidates[].target_path` 指定绝对路径，或先冻结该别名 |

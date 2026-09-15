@@ -12,8 +12,10 @@
 #   * `tier` ∈ light / normal / heavy，仅用于选择 `ui_wait_window` 的默认超时（8/15/25 s），
 #     不影响解析结果。
 #
-# 安全：新增条目等于放开一个可启动目标；如已设置 UIAGENT_LAUNCH_ALLOWLIST，
-#      还要保证别名 / 目标文件名在白名单内，否则启动会被拒绝（方案 RF6）。
+# 安全：新增条目等于放开一个可启动目标；白名单默认启用（UIAGENT_LAUNCH_ALLOWLIST 未配置时
+#      套用内置默认白名单，只含常用应用，不含 cmd / powershell / 终端等命令解释器），
+#      条目的别名 / 目标文件名必须在生效白名单内，否则启动会被拒绝（方案 RF6）；
+#      需放开默认白名单之外的入口时，显式配置 UIAGENT_LAUNCH_ALLOWLIST（设为 * / all 表示不校验）。
 version: 1
 
 apps:

@@ -153,7 +153,8 @@ ctrl.activate_window(hwnd=hwnd, show_hidden=True)   # 置前，可唤醒隐藏 /
 ctrl.ensure_app(app="微信")               # P1 统一入口：状态判定(S1~S4) → 唤醒 → 就绪确认 → 置前
 ctrl.app_status(["微信", "记事本"])        # P1 只读：批量状态查询（visible/minimized/hidden/not_running）
 
-# ---- 启动能力（P2；写操作，受 UIAGENT_LAUNCH_ENABLED / UIAGENT_LAUNCH_ALLOWLIST 约束）----
+# ---- 启动能力（P2；写操作，受 UIAGENT_LAUNCH_ENABLED / UIAGENT_LAUNCH_ALLOWLIST 约束：
+#      白名单默认启用，未配置 env 时套用内置默认白名单，不含 cmd / powershell / 终端）----
 ctrl.resolve_app("计算器")                 # 只读：只解析入口（alias_table → 注册表 App Paths → PATH → 开始菜单 → UWP）
 ctrl.launch_app("计算器", dry_run=True)    # 预演：只解析、不产生任何进程
 ctrl.launch_app("记事本", timeout=15.0)    # 启动 + 等窗口就绪 → pid / hwnd / resolved_by / launch_ms / wait_ms
@@ -175,7 +176,7 @@ ctrl.hotkey("ctrl", "s")
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
 | `UIAGENT_LAUNCH_ENABLED` | `1` | 启动能力总开关；设 `0` 时 `resolve_app`（只读解析）仍可用，但 `launch_app` / `ui_launch_app` 一律拒绝（`degraded_reason=launch_disabled`，含 `dry_run`）；`ui_wait_window` 属只读等待，**不受**该开关限制 |
-| `UIAGENT_LAUNCH_ALLOWLIST` | 空 | 允许启动的白名单（逗号分隔，别名 / 目标文件名，大小写不敏感）；空 = 不校验；非空时不在名单内 → `degraded_reason=not_allowlisted` 并落审计告警 |
+| `UIAGENT_LAUNCH_ALLOWLIST` | 未设置 → **内置默认白名单** | 允许启动的白名单（逗号分隔，别名 / 目标文件名，大小写不敏感）。①**未设置 / 空白** → 套用内置默认白名单 `DEFAULT_LAUNCH_ALLOWLIST`（记事本、计算器、画图、资源管理器、Edge、微信等常用应用，**不含** `cmd` / `powershell` / 终端等命令解释器）；②**显式配置** → 以配置为准，整体替换默认白名单；③**显式设为 `*` / `all`** → 不校验（显式解除限制）。不在生效白名单内 → `degraded_reason=not_allowlisted`（`hint` 标注来源与放开方式）并落审计告警 |
 
 > 两者**均为进程启动前置校验**：拒绝路径已用 `tasklist` 前后快照验证零进程产生（见第 7 节）。`resolve_app` 是只读解析，不受开关限制，可随时用于预演（等价于 `dry_run=true`）。
 
@@ -227,7 +228,7 @@ audit.record_text_policy()   # 文本策略：mask / hash / full
 | 未命中诊断 | 返回 `hints`（可执行排查建议）与 `candidates`（疑似候选窗口，含别名 / 进程名 / 类名）；Python 侧可用 `window_miss_report(...)` 单独获取 |
 | 激活 | `activate_window(hwnd=…, restore=True, show_hidden=True)`：最小化先还原、隐藏 / 托盘先 `ShowWindow` 唤醒，再用 `AttachThreadInput` 绕过前台锁定 |
 | 四状态唤起（P1） | `ensure_app(app=…)` / `ui_app_ensure` 按状态分层：S1 `visible` 直接置前（零等待）、S2 `minimized` 走 `SW_RESTORE` + bounds 稳定等待、S3 `hidden` 走 `SW_SHOW` + bounds 稳定等待；S4 未运行如实上报并返回 `candidates`，且可交由 P2 启动链路自动接管；`UIAGENT_ENSURE_V2=0` 可回退 `find_window` + `activate_window` 旧链路（`fallback="legacy"`：命中窗口 `state="unknown"`、未命中不带 `candidates`），已用同一窗口实测开关差分 |
-| 启动未运行应用（P2） | `resolve_app` / `launch_app` / `wait_app_window`（MCP：`ui_launch_app` / `ui_wait_window`）：解析链 `apps.yaml` 别名表 → 注册表 `App Paths` → `PATH` → 开始菜单 `.lnk` → UWP AUMID（Win 键搜索兜底本版本未实现）；`dry_run=True` 只预演不产生进程；`UIAGENT_LAUNCH_ENABLED=0` 一键禁用，`UIAGENT_LAUNCH_ALLOWLIST` 非空时严格校验；解析出多候选**不自动启动**（返回 `candidates` 由上层指定） |
+| 启动未运行应用（P2） | `resolve_app` / `launch_app` / `wait_app_window`（MCP：`ui_launch_app` / `ui_wait_window`）：解析链 `apps.yaml` 别名表 → 注册表 `App Paths` → `PATH` → 开始菜单 `.lnk` → UWP AUMID（Win 键搜索兜底本版本未实现）；`dry_run=True` 只预演不产生进程；`UIAGENT_LAUNCH_ENABLED=0` 一键禁用；`UIAGENT_LAUNCH_ALLOWLIST` **默认启用安全白名单**（未配置时套用内置默认白名单：常用应用，不含 `cmd` / `powershell` / 终端等命令解释器；显式配置以配置为准；显式设为 `*` / `all` 不校验）；解析出多候选**不自动启动**（返回 `candidates` 由上层指定） |
 | 遮挡诊断 | `probe_window_cover` 判断目标点是否被置顶窗口盖住（返回 `covered` / `covered_by` / `hint`）；坐标点击前自动**临时抬升**目标窗口 Z 序（`ensure_reachable`），点击后立即 `restore_after_boost` 复原，并在结果中返回 `auto_raise` / `hit_window` |
 | 性能 | 枚举阶段纯本地构造、不触碰 UIA（避免跨进程 COM 阻塞），仅在激活 / 定位具体窗口时按 `hwnd` 懒加载原生控件 |
 
@@ -254,6 +255,11 @@ P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → �
 | 白名单不匹配 + 真实启动请求 | `UIAGENT_LAUNCH_ALLOWLIST=notepad.exe`，请求 `计算器` | `ok=false` / `degraded_reason=not_allowlisted` / 无进程 |
 | 白名单匹配 → 放行 | `ALLOWLIST=notepad.exe`，请求 `记事本` | `ok=true` / `state=dry_run`（预演） |
 | 白名单大小写不敏感 | `ALLOWLIST=NOTEPAD`，请求 `notepad.exe` | `ok=true` / `state=dry_run`（误拒为 0） |
+| 默认白名单生效（未配置 env） | 不设 `UIAGENT_LAUNCH_ALLOWLIST`，请求 `记事本` | `ok=true` / `state=dry_run`（`allowlist_source=default`） |
+| 默认白名单拦截命令解释器 | 不设 `UIAGENT_LAUNCH_ALLOWLIST`，请求 `cmd` | `ok=false` / `not_allowlisted` / 无进程（`hint` 给出放开方式） |
+| 显式配置覆盖默认白名单 | `ALLOWLIST=weixin.exe,微信`，请求 `记事本` | `ok=false` / `not_allowlisted`（默认条目不再放行） |
+| 显式解除限制入口 | `ALLOWLIST=*`，请求 `cmd`（`dry_run=true`） | `ok=true` / `state=dry_run`（不校验，仅解析） |
+| 别名 / 空格 / 大小写归一 | `ALLOWLIST=" 记事本 , NOTEPAD "`，请求 `notepad.exe` | `ok=true` / `state=dry_run`（条目去空格 + 忽略大小写） |
 
 ---
 
@@ -296,7 +302,7 @@ P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → �
 - **窗口标题不可靠**：微信 / QQ 等应用窗口标题是登录昵称，判断归属请用 `app_alias` / `process_name`；定位优先用 `hwnd` / `class_name`。
 - **隐藏窗口不是"未运行"**：只看 `visible=true` 会误判；隐藏 / 托盘窗口在列表中 `visible=false`，可用 `hwnd` 唤醒激活。
 - **置顶窗口遮挡**：置顶窗口会盖住同区域普通窗口；`activate_window` 返回 `covered` / `covered_by` / `hint`，`click` 会自动临时抬升目标窗口并返回 `auto_raise` / `hit_window`。
-- **启动能力（P2）会真实拉起进程**：`ui_launch_app` / `ui_wait_window` 默认启用（`UIAGENT_LAUNCH_ENABLED=1`）；`UIAGENT_LAUNCH_ENABLED=0` 时整条链路直接拒绝（`degraded_reason=launch_disabled`，含 `dry_run`）；`UIAGENT_LAUNCH_ALLOWLIST` 非空时只允许白名单内的别名 / 目标文件名（拒绝时 `degraded_reason=not_allowlisted`）。建议先用 `dry_run=true` 预演解析结果再真实启动。`ensure_app` / `ui_app_ensure` 自身不启动进程，`launch_if_missing=true` 才交由启动链路接管；`degraded=true` 表示未达最优就绪状态而非失败。
+- **启动能力（P2）会真实拉起进程**：`ui_launch_app` / `ui_wait_window` 默认启用（`UIAGENT_LAUNCH_ENABLED=1`）；`UIAGENT_LAUNCH_ENABLED=0` 时整条链路直接拒绝（`degraded_reason=launch_disabled`，含 `dry_run`）；`UIAGENT_LAUNCH_ALLOWLIST` **默认启用安全白名单**：未设置 / 空白时套用内置默认白名单（只含记事本、计算器、画图、资源管理器、Edge、微信等常用应用，**不含** `cmd` / `powershell` / 终端等命令解释器），显式配置时以配置为准（可放开默认之外的入口），显式设为 `*` / `all` 表示不校验（显式解除限制）；不在生效白名单内 → `degraded_reason=not_allowlisted`，返回体 `hint` 标注拒绝来源与放开方式。建议先用 `dry_run=true` 预演解析结果再真实启动。`ensure_app` / `ui_app_ensure` 自身不启动进程，`launch_if_missing=true` 才交由启动链路接管；`degraded=true` 表示未达最优就绪状态而非失败。
 - **审计日志本地落盘**：`logs\audit-*.jsonl` 含调用参数（已脱敏）与窗口信息，敏感环境用 `UI_AGENT_AUDIT=0` 关闭。
 - **CLI stdout 为结构化 JSON**，日志走 stderr，便于 MCP Server 直接以子进程方式包裹。
 

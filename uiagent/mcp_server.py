@@ -641,7 +641,9 @@ def _op_launch_app(
     """启动应用并按 PID 等待窗口就绪（P2 改动点 #15，**写操作**：解析 → 启动 → 等就绪）。
 
     权限与降级：``UIAGENT_LAUNCH_ENABLED=0`` → 直接拒绝（``degraded_reason="launch_disabled"``）；
-    ``UIAGENT_LAUNCH_ALLOWLIST`` 非空时严格校验（``not_allowlisted``）；解析多候选时不自动选择
+    ``UIAGENT_LAUNCH_ALLOWLIST`` **默认启用**（未配置时套用内置默认白名单：常用应用，不含 cmd /
+    powershell / 终端等命令解释器），显式配置以配置为准，显式设为 ``*`` / ``all`` 表示不校验；
+    不在白名单内 → ``not_allowlisted``；解析多候选时不自动选择
     （``ambiguous_candidates``）；等待超时返回 ``state="launching"`` 而非异常（方案 RF7）。
     """
     if not str(app or "").strip():
@@ -1011,10 +1013,12 @@ async def ui_app_status(
         "场景，替代人工模拟「Win 键 + 搜索 + 回车」。解析顺序：内置别名表 → 注册表 App Paths → "
         "开始菜单 .lnk → UWP；多候选时**不自动选择**，返回 candidates 与 resolved_by 由上层决策。"
         "返回 state ∈ {launching, visible, minimized, hidden, not_running}、hwnd、pid、"
-        "resolved_by、target_path、launch_ms、wait_ms。"
+        "resolved_by、target_path、launch_ms、wait_ms、allowlist_source（default/env/unrestricted）。"
         "dry_run=true 只解析不启动（返回 resolved_by / target_path，不产生任何进程）。"
         "安全约束：UIAGENT_LAUNCH_ENABLED=0 时直接拒绝（degraded_reason='launch_disabled'）；"
-        "UIAGENT_LAUNCH_ALLOWLIST 非空时严格校验（'not_allowlisted'）；等待窗口超时返回 "
+        "UIAGENT_LAUNCH_ALLOWLIST 默认启用（未配置时套用内置默认白名单，只含常用应用，"
+        "不含 cmd / powershell / 终端等命令解释器），显式配置以配置为准，显式设为 * / all 表示不校验；"
+        "不在白名单内返回 'not_allowlisted'；等待窗口超时返回 "
         "state='launching'（不是错误）。"
     ),
 )

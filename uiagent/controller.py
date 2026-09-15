@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .audit import describe_text, get_audit_logger
 from .base import Rect, UIElement, OCRText
@@ -1804,31 +1804,99 @@ class UniversalController:
             raise ValueError("必须提供 target，或同时提供 x / y 坐标")
         return LocateResult(target=f"({x}, {y})", found=True, source="coords", x=int(x), y=int(y))
 
-    def type_text(self, text: str, interval: float = 0.02) -> None:
-        """输入文本（含中文时自动走剪贴板）。"""
-        audit = get_audit_logger()
-        started = time.perf_counter()
-        self.keyboard.type_text(text, interval=interval)
-        if audit is not None:
-            audit.log_action(
-                "type",
-                method="keystroke",
-                elapsed_ms=round((time.perf_counter() - started) * 1000.0, 3),
-                **describe_text(text, audit.text_policy),
-            )
+    # ------------------------------------------------------------ 文本输入
+    def _focus_mismatch(self, target_hwnd: Optional[int]) -> bool:
+        """前置焦点校验（方案 3.4）：调用方**未声明目标窗口**则不校验。
 
-    def type_chinese(self, text: str) -> None:
-        """通过剪贴板输入中文。"""
+        声明 ``target_hwnd`` 且当前前台不符 → ``True``（默认仅留痕、不阻断；
+        ``UIAGENT_TYPE_REQUIRE_FOCUS=1`` 时由 keyboard 层据此拒写）。
+        """
+        if not target_hwnd:
+            return False
+        try:
+            current = int(self.accessibility.foreground_hwnd() or 0)
+        except Exception:  # pragma: no cover - 诊断失败不阻断
+            logger.debug("前台窗口读取失败", exc_info=True)
+            return False
+        return bool(current) and current != int(target_hwnd)
+
+    def _readback_probe(self, element: Any = None) -> Optional[Callable[[], Optional[str]]]:
+        """构造回读探针（仅 ``UIAGENT_TYPE_READBACK=1`` 时被 keyboard 层消费）。
+
+        读取目标控件当前文本（ValuePattern，只读）；控件不可读时返回 ``None``，
+        由 keyboard 层记为 ``readback={"checked": true, "ok": null, ...}``，不触发降级。
+        """
+        element = element if element is not None else self.get_focused_element()
+        if element is None:
+            return None
+
+        def _probe() -> Optional[str]:
+            return self.get_element_value(element)
+
+        return _probe
+
+    @staticmethod
+    def _type_audit_fields(outcome: Any) -> Dict[str, Any]:
+        """把 ``TypeOutcome`` 摊平为审计字段（字段字典见方案 4.3）。"""
+        return {
+            "ok": bool(getattr(outcome, "ok", False)),
+            "chars": int(getattr(outcome, "chars", 0)),
+            "method_requested": getattr(outcome, "method_requested", ""),
+            "method_planned": getattr(outcome, "method_planned", ""),
+            "method_used": getattr(outcome, "method_used", ""),
+            "degraded": bool(getattr(outcome, "degraded", False)),
+            "degrade_reason": getattr(outcome, "degrade_reason", ""),
+            "degrade_chain": getattr(outcome, "degrade_chain", []),
+            "clipboard": getattr(outcome, "clipboard", {}),
+            "readback": getattr(outcome, "readback", {"checked": False}),
+            "focus_mismatch": bool(getattr(outcome, "focus_mismatch", False)),
+            "app_unknown": bool(getattr(outcome, "app_unknown", False)),
+        }
+
+    def type_text(
+        self,
+        text: str,
+        interval: float = 0.02,
+        method: str = "auto",
+        app_process: Optional[str] = None,
+        target_hwnd: Optional[int] = None,
+    ) -> Any:
+        """输入文本（``method``: auto 分层路由 / unicode / keystroke / clipboard）。
+
+        审计口径（方案 4.3）：``method_requested`` / ``method_used`` / ``degraded`` /
+        ``degrade_reason`` / ``degrade_chain`` / ``clipboard`` / ``readback`` /
+        ``focus_mismatch`` 全部由 keyboard 层返回值填充，**不再写死 ``method="keystroke"``**。
+        """
+        from .executor.keyboard import type_readback_enabled
+
         audit = get_audit_logger()
         started = time.perf_counter()
-        self.keyboard.type_via_clipboard(text)
+        focus_mismatch = self._focus_mismatch(target_hwnd)
+        readback = self._readback_probe() if type_readback_enabled() else None
+        outcome = self.keyboard.type_text(
+            text,
+            interval=interval,
+            method=method,
+            app_process=app_process,
+            readback=readback,
+            focus_mismatch=focus_mismatch,
+        )
         if audit is not None:
             audit.log_action(
                 "type",
-                method="clipboard",
                 elapsed_ms=round((time.perf_counter() - started) * 1000.0, 3),
+                **self._type_audit_fields(outcome),
                 **describe_text(text, audit.text_policy),
             )
+        return outcome
+
+    def type_chinese(self, text: str) -> Any:
+        """通过剪贴板输入中文（等价 ``method="clipboard"``，保留既有入口）。"""
+        return self.type_text(text, method="clipboard")
+
+    def type_unicode(self, text: str, interval: float = 0.02) -> Any:
+        """Unicode 直落输入（新增能力，审计 ``method_requested="unicode"``）。"""
+        return self.type_text(text, interval=interval, method="unicode")
 
     def hotkey(self, *keys: str) -> None:
         """发送快捷键。"""

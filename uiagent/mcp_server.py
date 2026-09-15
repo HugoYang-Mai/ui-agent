@@ -693,23 +693,46 @@ def _op_app_status(
     return ctrl.app_status(apps=apps or [], include_not_running=bool(include_not_running))
 
 
-def _op_type(ctrl: Any, text: str, interval: float, method: str) -> Dict[str, Any]:
+def _op_type(
+    ctrl: Any,
+    text: str,
+    interval: float,
+    method: str,
+    app_process: Optional[str] = None,
+    target_hwnd: Optional[int] = None,
+) -> Dict[str, Any]:
+    """输入文本（方案 3.3：四取值四分派 + 降级链 + 留痕字段）。
+
+    分派：``unicode`` / ``keystroke`` / ``clipboard`` 为强制档，``auto`` 走分层路由；
+    返回值在 ``ok / chars / elapsed_seconds`` 之外追加 ``method_requested`` /
+    ``method_used`` / ``degraded`` / ``degrade_reason`` / ``degrade_chain`` /
+    ``clipboard`` / ``readback``（字段语义见方案 4.3）。
+    """
     if text is None or text == "":
         return {"ok": False, "error": "text 不能为空"}
     started = time.perf_counter()
-    mode = (method or "auto").lower()
-    if mode == "clipboard":
-        ctrl.type_chinese(text)
-    elif mode in ("auto", "keystroke"):
-        ctrl.type_text(text, interval=float(interval))
-    else:
-        return {"ok": False, "error": f"method 仅支持 auto / keystroke / clipboard，收到 {method!r}"}
-    return {
-        "ok": True,
-        "chars": len(text),
-        "method": mode,
-        "elapsed_seconds": round(time.perf_counter() - started, 3),
-    }
+    requested = (method or "auto").strip().lower()
+    if requested not in ("auto", "unicode", "keystroke", "clipboard"):
+        return {
+            "ok": False,
+            "error": f"method 仅支持 auto / unicode / keystroke / clipboard，收到 {method!r}",
+        }
+    outcome = ctrl.type_text(
+        text,
+        interval=float(interval),
+        method=requested,
+        app_process=app_process,
+        target_hwnd=target_hwnd,
+    )
+    payload: Dict[str, Any] = (
+        outcome.to_dict() if hasattr(outcome, "to_dict") else dict(outcome or {})
+    )
+    # 向后兼容：旧调用方读取的 method 字段含义为"请求值"，保留同名键
+    payload["method"] = payload.get("method_requested", requested)
+    payload["elapsed_seconds"] = round(time.perf_counter() - started, 3)
+    if app_process:
+        payload.setdefault("app_process", app_process)
+    return payload
 
 
 def _op_hotkey(ctrl: Any, keys: Any, delay: float) -> Dict[str, Any]:
@@ -1261,22 +1284,32 @@ async def ui_click(
 @server.tool(
     name="ui_type",
     description=(
-        "向当前焦点处输入文本（写操作）。纯 ASCII 走键盘逐字符输入，含中文时自动改用剪贴板粘贴，"
+        "向当前焦点处输入文本（写操作）。默认 method=auto 走分层路由：非 ASCII / 含换行制表符 / "
+        "超长文本自动改用剪贴板粘贴（粘贴后会还原你原本的剪贴板内容），终端类应用走按键注入，"
+        "其余纯 ASCII 场景走 Unicode 直落（不经输入法，不会被 IME 吞字）。"
+        "返回值含实际生效通道与降级痕迹（method_requested / method_used / degraded / degrade_reason / "
+        "degrade_chain / clipboard / readback），任何降级都不会静默。"
         "调用前请确保目标输入框已获得焦点（可先用 ui_click 点击）。"
     ),
 )
 async def ui_type(
     text: Annotated[str, Field(description="要输入的文本（支持中文与换行）")],
     interval: Annotated[
-        float, Field(description="逐字符间隔秒数（仅键盘输入模式生效）", ge=0.0, le=1.0)
+        float, Field(description="逐字符间隔秒数（仅 keystroke 强制按键档生效）", ge=0.0, le=1.0)
     ] = 0.02,
     method: Annotated[
         str,
         Field(
-            description="输入方式：auto（默认，含中文自动走剪贴板）/ keystroke（强制逐字符键盘输入）/ clipboard（强制剪贴板粘贴）",
-            pattern="^(auto|keystroke|clipboard)$",
+            description=(
+                "输入方式：auto（默认，分层路由）/ unicode（Unicode 直落，不经输入法，推荐纯 ASCII）"
+                "/ keystroke（强制逐字符按键注入，IME 激活态可能吞字）/ clipboard（强制剪贴板粘贴）"
+            ),
+            pattern="^(auto|unicode|keystroke|clipboard)$",
         ),
     ] = "auto",
+    target_hwnd: Annotated[
+        int, Field(description="可选：预期目标窗口句柄，用于焦点校验（默认仅留痕，不阻断）")
+    ] = 0,
 ) -> str:
     """输入文本。"""
     return await _guard(
@@ -1284,8 +1317,9 @@ async def ui_type(
         text,
         interval,
         method,
+        target_hwnd=target_hwnd or None,
         tool="ui_type",
-        audit_args={"text": text, "interval": interval, "method": method},
+        audit_args={"text": text, "interval": interval, "method": method, "target_hwnd": target_hwnd},
     )
 
 

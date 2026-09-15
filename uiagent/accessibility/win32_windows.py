@@ -753,20 +753,185 @@ def select_best_window(windows: Sequence[Win32Window]) -> Optional[Win32Window]:
     return sorted(pool, key=window_rank)[0]
 
 
+# ------------------------------------------------------------------ 状态分层（P1 改动点 #7）
+#: 统一窗口状态枚举：S1 ``visible`` / S2 ``minimized`` / S3 ``hidden`` / ``cloaked``（UWP 挂起）/ 未运行
+WINDOW_STATES: Tuple[str, ...] = ("visible", "minimized", "hidden", "cloaked", "not_found")
+
+#: ``show_window`` 轮询参数（P1 改动点 #8）：10 ms 步进 + 500 ms 总超时上限（原为固定 ``sleep(0.25)``）
+SHOW_POLL_INTERVAL_MS = 10
+SHOW_POLL_TIMEOUT_MS = 500
+
+#: bounds 稳定判定：容差 2 px，默认需持续 150 ms，超时 3 s（P1 改动点 #7/#9）
+BOUNDS_STABLE_TOLERANCE = 2
+BOUNDS_STABLE_MS = 150.0
+BOUNDS_STABLE_TIMEOUT = 3.0
+
+
+def state_from_flags(visible: Any, iconic: Any, cloaked: Any = False) -> str:
+    """由 ``visible`` / ``iconic`` / ``cloaked`` 布尔位推导统一状态（纯函数，零系统调用）。
+
+    与 :func:`window_state` 同一判定口径；供 UIA 侧窗口列表复用，避免逐窗口追加 Win32 查询。
+    """
+    if cloaked:
+        return "cloaked"     # UWP 挂起 / 虚拟桌面切换中的窗口：不计入 S1~S3
+    if not visible:
+        return "hidden"      # S3 托盘驻留 / 隐藏
+    if iconic:
+        return "minimized"   # S2 任务栏最小化
+    return "visible"         # S1 可见窗口
+
+
+def window_state(win: Any = None, hwnd: Optional[int] = None) -> str:
+    """判定窗口状态 → ``visible`` / ``minimized`` / ``hidden`` / ``cloaked`` / ``not_found``。
+
+    ``win`` 可传 :class:`Win32Window`（复用已采集字段）或整数 hwnd（回读 Win32）；``hwnd``
+    显式给出时优先。窗口不存在 / 已关闭返回 ``not_found``。
+    """
+    handle = int(hwnd or 0)
+    if not handle and isinstance(win, int):
+        handle, win = int(win), None
+    if not handle and win is not None:
+        handle = int(getattr(win, "hwnd", 0) or 0)
+    if not handle or not is_window(handle):
+        return "not_found"
+    if isinstance(win, Win32Window) and not hwnd:
+        return state_from_flags(win.visible, win.iconic, win.cloaked)
+    if _is_cloaked(handle):
+        return "cloaked"
+    if is_window_visible(handle) is False:
+        return "hidden"
+    if is_iconic(handle):
+        return "minimized"
+    return "visible"
+
+
+def wait_bounds_stable(
+    hwnd: int,
+    stable_ms: float = BOUNDS_STABLE_MS,
+    timeout: float = BOUNDS_STABLE_TIMEOUT,
+    interval_ms: float = SHOW_POLL_INTERVAL_MS,
+    tolerance: int = BOUNDS_STABLE_TOLERANCE,
+) -> Dict[str, Any]:
+    """等待窗口 bounds 稳定（P1 改动点 #7，供 ``activate_window(wait_ready=True)`` 使用）。
+
+    判定：连续两次采样的矩形「四元组差值均 ≤ ``tolerance`` px」，且该状态已持续 ``stable_ms``；
+    同时要求 bounds 非空（宽高 > 0），避免"刚 ``SW_SHOW`` 完就点击"落到未完成布局的窗口。
+
+    :return: ``{"ok", "hwnd", "stable", "elapsed_ms", "samples", "bounds", "state", "degraded_reason"?}``
+        —— 超时未稳定时 ``ok=False`` / ``stable=False`` / ``degraded_reason="window_unstable"``，
+        **不抛异常**（调用方按降级处理，见方案 RF/3.5）。
+    """
+    started = time.perf_counter()
+    interval = max(0.005, float(interval_ms) / 1000.0)
+    deadline = started + max(0.0, float(timeout))
+    need_seconds = max(0.0, float(stable_ms)) / 1000.0
+    previous: Optional[Rect] = None
+    last_change = started
+    samples = 0
+    bounds: Rect = (0, 0, 0, 0)
+
+    while True:
+        if not is_window(hwnd):
+            return {
+                "ok": False,
+                "hwnd": int(hwnd or 0),
+                "stable": False,
+                "elapsed_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                "samples": samples,
+                "bounds": list(bounds),
+                "state": "not_found",
+                "degraded_reason": "window_closed",
+                "error": f"hwnd={hwnd} 在等待 bounds 稳定期间已关闭",
+            }
+
+        current = get_window_rect(hwnd)
+        samples += 1
+        bounds = current
+        now = time.perf_counter()
+        if previous is None or any(
+            abs(int(a) - int(b)) > int(tolerance) for a, b in zip(current, previous)
+        ):
+            last_change = now
+        previous = current
+
+        non_empty = int(current[2]) > 0 and int(current[3]) > 0
+        if non_empty and (now - last_change) >= need_seconds:
+            return {
+                "ok": True,
+                "hwnd": int(hwnd or 0),
+                "stable": True,
+                "elapsed_ms": round((now - started) * 1000.0, 3),
+                "samples": samples,
+                "bounds": list(current),
+                "state": window_state(hwnd=hwnd),
+            }
+        if now >= deadline:
+            return {
+                "ok": False,
+                "hwnd": int(hwnd or 0),
+                "stable": False,
+                "elapsed_ms": round((now - started) * 1000.0, 3),
+                "samples": samples,
+                "bounds": list(current),
+                "state": window_state(hwnd=hwnd),
+                "degraded_reason": "window_unstable",
+                "error": f"bounds 在 {float(timeout):.2f}s 内未稳定（samples={samples}）",
+            }
+        time.sleep(interval)
+
+
+def list_app_windows(
+    app: Any = None,
+    windows: Optional[Sequence[Win32Window]] = None,
+    limit: int = 0,
+) -> List[Win32Window]:
+    """按应用线索聚合候选窗口（P1 改动点 #7）。
+
+    ``app`` 支持应用别名（「微信」）/ 进程名（``weixin.exe``）/ 可执行路径片段 / 标题片段；
+    留空时返回全部「像应用窗口」的顶层窗口（含隐藏的主窗口）。结果按 :func:`window_rank`
+    排序（可见未最小化 → 可见已最小化 → 隐藏，同档面积大者优先），供多实例场景返回 ``candidates``。
+    """
+    pool = app_windows(windows)
+    key = str(app or "").strip().lower()
+    if key:
+        matched: List[Win32Window] = []
+        for win in pool:
+            alias = str(win.app_alias or "").lower()
+            process = str(win.process_name or "").lower()
+            process_base = process.replace("/", "\\").rsplit("\\", 1)[-1]
+            title = str(win.title or "").lower()
+            if key in (alias, process, process_base) or key in alias or key in process or key in title:
+                matched.append(win)
+        pool = matched
+    ordered = sorted(pool, key=window_rank)
+    if limit and int(limit) > 0:
+        return ordered[: int(limit)]
+    return ordered
+
+
 # ------------------------------------------------------------------ 窗口唤醒
 def show_window(hwnd: int) -> Dict[str, Any]:
     """把隐藏 / 最小化的窗口显示出来（``SW_SHOW`` / ``SW_RESTORE``）。
 
-    :return: ``{"ok", "hwnd", "was_visible", "was_iconic", "shown", "visible_after", "iconic_after"}``
+    P1（改动点 #8）：固定 ``time.sleep(0.25)`` 改为 **10 ms 步进轮询** ``IsIconic`` /
+    ``IsWindowVisible``，总超时上限 500 ms。语义不变（仍只在"需要显示"时调用 ``ShowWindow``），
+    但已可见窗口零等待、还原动作通常 10~30 ms 返回，S2/S3 各路径预计节省 150~230 ms。
+
+    :return: ``{"ok", "hwnd", "state", "was_visible", "was_iconic", "shown", "visible_after",
+        "iconic_after", "polls", "waited_ms", "timed_out"}``
     """
     state: Dict[str, Any] = {
         "ok": False,
         "hwnd": int(hwnd or 0),
+        "state": "not_found",
         "was_visible": None,
         "was_iconic": None,
         "shown": False,
         "visible_after": None,
         "iconic_after": None,
+        "polls": 0,
+        "waited_ms": 0.0,
+        "timed_out": False,
     }
     if not is_window(hwnd):
         state["error"] = f"hwnd={hwnd} 不是有效窗口（可能已关闭）"
@@ -783,10 +948,28 @@ def show_window(hwnd: int) -> Dict[str, Any]:
         # 隐藏窗口：托盘隐藏的 Qt/微信窗口需要 SW_SHOW 才会重新参与显示
         _user32.ShowWindow(handle, SW_SHOW)
         state["shown"] = True
-    time.sleep(0.25)
 
-    state["visible_after"] = bool(_user32.IsWindowVisible(handle))
-    state["iconic_after"] = bool(_user32.IsIconic(handle))
+    # P1（改动点 #8）：仅在真的发起了显示动作时轮询等待，已可见窗口零等待（省 250 ms）
+    poll_started = time.perf_counter()
+    visible_now = bool(_user32.IsWindowVisible(handle))
+    iconic_now = bool(_user32.IsIconic(handle))
+    if state["shown"]:
+        deadline = poll_started + SHOW_POLL_TIMEOUT_MS / 1000.0
+        while True:
+            time.sleep(SHOW_POLL_INTERVAL_MS / 1000.0)
+            state["polls"] += 1
+            visible_now = bool(_user32.IsWindowVisible(handle))
+            iconic_now = bool(_user32.IsIconic(handle))
+            if visible_now and not iconic_now:
+                break
+            if time.perf_counter() >= deadline:
+                state["timed_out"] = True
+                break
+    state["waited_ms"] = round((time.perf_counter() - poll_started) * 1000.0, 3)
+
+    state["visible_after"] = visible_now
+    state["iconic_after"] = iconic_now
+    state["state"] = state_from_flags(visible_now, iconic_now, _is_cloaked(int(hwnd)))
     state["ok"] = True
     return state
 

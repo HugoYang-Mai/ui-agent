@@ -168,6 +168,18 @@ def _context_ttl() -> float:
         return 30.0
 
 
+# ---------------------------------------------------------------- P1：四状态分层
+#: 统一入口 ``ensure_app`` 对外状态：S1 ``visible`` / S2 ``minimized`` / S3 ``hidden``
+#: / ``cloaked``（UWP 挂起，不计入 S1~S3）/ ``not_running``（S4，P1 只如实上报不启动）
+_APP_STATES = ("visible", "minimized", "hidden", "cloaked", "not_running")
+
+
+def _ensure_v2_enabled() -> bool:
+    """``UIAGENT_ENSURE_V2=0`` 时 ``ensure_app`` 回退为 ``find_window`` + ``activate_window`` 旧链路。"""
+    raw = str(os.environ.get("UIAGENT_ENSURE_V2", "1") or "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 @dataclass
 class AppContextEntry:
     """``app → {hwnd, bounds, state}`` 缓存条目（只读快照，不含任何控件句柄）。"""
@@ -489,10 +501,13 @@ class UniversalController:
         hwnd: Optional[int] = None,
         class_name: Optional[str] = None,
         show_hidden: bool = True,
+        wait_ready: bool = True,
     ) -> Dict[str, Any]:
         """定位并激活窗口（写操作：把窗口置为前台，隐藏/最小化时先唤醒）。
 
-        :return: ``{"found", "activated", "hwnd", "window", "detail", "hints"?}``
+        P1（改动点 #9）：``wait_ready=True`` 时置前后确认 bounds 稳定，避免刚唤醒就定位/点击。
+
+        :return: ``{"found", "activated", "hwnd", "window", "state", "timing", "detail", "hints"?}``
             未命中时额外返回 ``hints``（可执行的排查建议）与 ``candidates``。
         """
         window = self.find_window(
@@ -534,10 +549,11 @@ class UniversalController:
                 )
             return payload
         result = self.accessibility.activate_window(
-            window, restore=restore, show_hidden=show_hidden
+            window, restore=restore, show_hidden=show_hidden, wait_ready=wait_ready
         )
         result["found"] = True
         if audit is not None:
+            result_timing = result.get("timing") or {}
             audit.log_action(
                 "activate",
                 title=title or "",
@@ -549,6 +565,12 @@ class UniversalController:
                 hit_title=str(getattr(window, "name", "") or ""),
                 hit_app_alias=str(getattr(window, "app_alias", "") or ""),
                 hit_process_name=str(getattr(window, "process_name", "") or ""),
+                state=str(result.get("state") or ""),
+                wait_ready=bool(wait_ready),
+                settle_ms=float(result_timing.get("settle_ms") or 0.0),
+                covered=bool(result.get("covered")),
+                degraded=bool(result.get("degraded")),
+                degraded_reason=str(result.get("degraded_reason") or ""),
                 detail=str(result.get("detail") or ""),
             )
         return result
@@ -1087,6 +1109,531 @@ class UniversalController:
                 detail=payload["detail"],
             )
         return payload
+
+    # ============================================================ P1：统一入口 + 状态分层
+    @staticmethod
+    def _app_pool(app_name: Any) -> List[Any]:
+        """按多档线索键聚合应用窗口候选（P2 兜底：别名表别名，覆盖打包应用宿主进程窗口）。
+
+        依次用「原形 → 去后缀 → 别名」尝试 ``list_app_windows``，首个命中即返回
+        （首个命中已由 ``select_best_window`` 取最优，继续扩大键不会更准，反而更慢）。
+        """
+        from .accessibility import win32_windows as w32
+        from .launcher import app_match_keys
+
+        text = str(app_name or "").strip()
+        if not text:
+            return []
+        for key in app_match_keys(text):
+            pool = w32.list_app_windows(key)
+            if pool:
+                return pool
+        return []
+
+    def ensure_app(
+        self,
+        app: Any = None,
+        hwnd: Optional[int] = None,
+        title: Optional[str] = None,
+        process_name: Optional[str] = None,
+        launch_if_missing: bool = False,
+        require_foreground: bool = True,
+        wait_ready: bool = True,
+        timeout: Optional[float] = None,
+        restore: bool = True,
+        launch_method: str = "auto",
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """统一入口（P1 改动点 #6 + P2 改动点 #13）：一次调用完成「状态判定 → 启动/唤醒/置前 →
+        就绪确认 → 回填缓存」。
+
+        四状态分层（方案 2.4）：
+
+        - **S1** ``visible``：已可见窗口直接置前，零等待（不再固定 ``sleep(0.25)``）；
+        - **S2** ``minimized``：``SW_RESTORE`` → bounds 稳定等待 → 置前；
+        - **S3** ``hidden``：``SW_SHOW`` → bounds 稳定等待 → 置前；
+        - **S4** 未运行：``launch_if_missing=True`` 时走 :mod:`uiagent.launcher`（方案 2.4 第 3 步
+          dispatch）——解析入口 → 启动 → 按 PID 等待窗口就绪 → 回到 S1~S3 置前流程；
+          ``launch_if_missing=False`` 时保持 P1 行为（只上报 ``not_running`` +
+          ``degraded_reason="app_not_running"``，返回 ``candidates``）。
+          ``dry_run=True`` 仅解析启动入口、**不产生进程**。
+
+        ``UIAGENT_ENSURE_V2=0`` 时退化为 ``find_window`` + ``activate_window`` 旧链路
+        （``state="unknown"``，``timing`` 仅保留 ``total_ms``）。
+
+        未稳定 / 置前被拦截 / 超时均为**降级返回**，不抛异常。
+
+        :return: ``{"ok", "found", "app", "state", "hwnd", "window", "activated", "cached",
+            "timing"{snapshot_ms, show_ms, settle_ms, foreground_ms, launch_ms, total_ms},
+            "reachable", "covered_by", "degraded", "degraded_reason", "candidates", "detail"}``
+        """
+        from .accessibility import win32_windows as w32
+
+        started = time.perf_counter()
+        audit = get_audit_logger()
+        app_name = str(app or "").strip()
+        budget = float(timeout) if timeout else 0.0
+
+        # ---- 解析目标窗口：hwnd 直给 → AppContext 缓存 → 应用候选聚合 → 标题/进程名
+        cached = False
+        pool: List[Any] = []
+        resolved_hwnd = 0
+        if hwnd:
+            resolved_hwnd = int(hwnd)
+        if not resolved_hwnd and app_name:
+            entry = self._ctx_lookup(app_name)
+            if entry is not None and w32.is_window(int(entry.hwnd)):
+                resolved_hwnd = int(entry.hwnd)
+                cached = True
+        if not resolved_hwnd and app_name:
+            pool = self._app_pool(app_name)
+            best = w32.select_best_window(pool) if pool else None
+            if best is not None:
+                resolved_hwnd = int(best.hwnd)
+        if not resolved_hwnd and (title or process_name or app_name):
+            found = (
+                self.find_window(title=title, process_name=process_name)
+                if (title or process_name)
+                else None
+            ) or self.find_window(title=title or app_name or None) or self.find_window(
+                process_name=process_name or app_name or None
+            )
+            if found is not None:
+                resolved_hwnd = int(getattr(found, "hwnd", 0) or 0)
+        snapshot_ms = (time.perf_counter() - started) * 1000.0
+        if not resolved_hwnd and not pool:
+            pool = self._app_pool(app_name) if app_name else []
+
+        # ---- S4 未运行 → dispatch 到 launcher（P2 改动点 #13/#15；需显式授权 launch_if_missing）
+        launch_info: Optional[Dict[str, Any]] = None
+        launch_ms: Optional[float] = None
+        if not resolved_hwnd and app_name and (launch_if_missing or dry_run):
+            launch_info = self.launch_app(
+                app_name,
+                method=launch_method,
+                dry_run=dry_run,
+                timeout=budget or None,
+                wait=True,
+            )
+            launch_ms = float(launch_info.get("launch_ms") or 0.0)
+            if launch_info.get("hwnd"):
+                resolved_hwnd = int(launch_info["hwnd"])
+                pool = self._app_pool(app_name) or pool
+
+        if not _ensure_v2_enabled():
+            return self._ensure_app_legacy(
+                app_name=app_name,
+                resolved_hwnd=resolved_hwnd,
+                title=title,
+                process_name=process_name,
+                restore=restore,
+                snapshot_ms=snapshot_ms,
+                started=started,
+                audit=audit,
+            )
+
+        if not resolved_hwnd:
+            # ---- S4 未运行：如实上报 + 返回候选（P1 不启动）
+            report = window_miss_report(
+                title=title or app_name or None, process_name=process_name, hwnd=hwnd
+            )
+            candidates = list(report.get("candidates") or [])
+            for win in pool[:8]:
+                item = win.to_dict() if hasattr(win, "to_dict") else {"hwnd": int(win.hwnd)}
+                item["state"] = w32.window_state(win)
+                if all(int(c.get("hwnd") or 0) != int(item.get("hwnd") or 0) for c in candidates):
+                    candidates.append(item)
+            total_ms = (time.perf_counter() - started) * 1000.0
+            if launch_info is not None:
+                # P2：启动已尝试（或 dry_run 预演），以 launcher 的结论为准
+                degraded_reason = str(launch_info.get("degraded_reason") or "")
+                if launch_info.get("state") == "launching" and not degraded_reason:
+                    degraded_reason = "launch_timeout"
+                ok_flag = bool(launch_info.get("ok"))
+            else:
+                degraded_reason = "launch_unavailable" if launch_if_missing else "app_not_running"
+                ok_flag = False
+            payload: Dict[str, Any] = {
+                "ok": ok_flag,
+                "found": False,
+                "activated": False,
+                "app": app_name,
+                "state": "not_running",
+                "hwnd": 0,
+                "window": None,
+                "cached": False,
+                "reachable": False,
+                "covered_by": None,
+                "degraded": bool(degraded_reason),
+                "degraded_reason": degraded_reason,
+                "dry_run": bool(dry_run),
+                "launch": launch_info,
+                "timing": {
+                    "snapshot_ms": round(snapshot_ms, 3),
+                    "show_ms": 0.0,
+                    "settle_ms": 0.0,
+                    "foreground_ms": 0.0,
+                    "launch_ms": round(launch_ms, 3) if launch_ms is not None else None,
+                    "total_ms": round(total_ms, 3),
+                },
+                "candidates": candidates,
+                "hints": report.get("hints") or [],
+                "detail": (
+                    f"未找到应用窗口（app={app_name!r} title={title!r} process_name={process_name!r}）；"
+                    + (
+                        "已按 launcher 尝试启动，但该窗口仍未就绪，详见 launch 字段"
+                        if launch_info is not None
+                        else "未请求启动（launch_if_missing=False），可从上文 candidates 指定 hwnd"
+                    )
+                ),
+            }
+            if audit is not None:
+                audit.log_ensure(
+                    app=app_name,
+                    state="not_running",
+                    hwnd=0,
+                    activated=False,
+                    cached=False,
+                    ensure_ms=round(total_ms, 3),
+                    timing=payload["timing"],
+                    degraded=True,
+                    degraded_reason=degraded_reason,
+                    candidates_count=len(candidates),
+                    detail=payload["detail"],
+                )
+            return payload
+
+        # ---- 状态判定（S1~S3；cloaked 单独标注，不计入 S1~S3）
+        state_before = w32.window_state(hwnd=resolved_hwnd)
+        state = "not_running" if state_before == "not_found" else state_before
+
+        remaining = (budget - (time.perf_counter() - started)) if budget > 0 else -1.0
+        # S1（已可见）零等待：仅「还原 / 显示」的状态迁移（S2/S3）才等待 bounds 稳定
+        transition = state_before != "visible"
+        wait = bool(wait_ready) and transition and (True if budget <= 0 else remaining > 0.05)
+        timeout_hit = bool(budget > 0 and remaining <= 0.05)
+
+        act: Dict[str, Any] = {"activated": False, "hwnd": resolved_hwnd, "detail": "未请求置前"}
+        if state in ("visible", "minimized", "hidden", "cloaked"):
+            act = (
+                self.accessibility.activate_window(
+                    hwnd=resolved_hwnd,
+                    restore=restore,
+                    show_hidden=True,
+                    wait_ready=wait,
+                )
+                or {}
+            )
+        activated = bool(act.get("activated"))
+        activated_hwnd = int(act.get("hwnd") or resolved_hwnd)
+        state_after = w32.window_state(hwnd=activated_hwnd or resolved_hwnd)
+        if state_after != "not_found":
+            state = state_after
+
+        element = self.window_from_hwnd(activated_hwnd or resolved_hwnd)
+        window_dict: Optional[Dict[str, Any]] = None
+        if element is not None:
+            window_dict = element.to_dict()
+        elif resolved_hwnd:
+            raw = w32.window_from_hwnd(resolved_hwnd)
+            if raw is not None:
+                window_dict = raw.to_dict()
+        if not window_dict:
+            window_dict = {"hwnd": int(activated_hwnd or resolved_hwnd), "state": state}
+
+        # ---- 多实例：返回 candidates 供上层复核（方案 RF9）
+        candidates: List[Dict[str, Any]] = []
+        if not pool and app_name:
+            pool = self._app_pool(app_name)
+        for win in pool[:8]:
+            item = win.to_dict() if hasattr(win, "to_dict") else {"hwnd": int(win.hwnd)}
+            item["state"] = w32.window_state(win)
+            item["selected"] = int(item.get("hwnd") or 0) == int(resolved_hwnd)
+            candidates.append(item)
+
+        covered = act.get("covered")
+        reachable = True if covered is None else not bool(covered)
+        act_timing = act.get("timing") or {}
+        total_ms = (time.perf_counter() - started) * 1000.0
+        timing = {
+            "snapshot_ms": round(snapshot_ms, 3),
+            "show_ms": round(float(act_timing.get("show_ms") or 0.0), 3),
+            "settle_ms": round(float(act_timing.get("settle_ms") or 0.0), 3),
+            "foreground_ms": round(float(act_timing.get("foreground_ms") or 0.0), 3),
+            "launch_ms": round(launch_ms, 3) if launch_ms is not None else None,
+            "total_ms": round(total_ms, 3),
+        }
+
+        degraded = False
+        degraded_reason = ""
+        if state == "cloaked":
+            degraded, degraded_reason = True, "app_window_cloaked"
+        if not activated and require_foreground:
+            degraded, degraded_reason = True, "foreground_locked"
+        elif not activated and not degraded:
+            degraded, degraded_reason = True, "activate_failed"
+        if act.get("degraded") and not degraded:
+            degraded, degraded_reason = True, str(act.get("degraded_reason") or "window_unstable")
+        if timeout_hit and not activated:
+            degraded, degraded_reason = True, "timeout"
+
+        # ---- 回填缓存（仅 S1~S3 且 hwnd 有效）
+        if state in ("visible", "minimized", "hidden") and (activated_hwnd or resolved_hwnd):
+            self._ctx.set(
+                app_name
+                or str(window_dict.get("app_alias") or "")
+                or str(window_dict.get("process_name") or ""),
+                int(activated_hwnd or resolved_hwnd),
+                bounds=window_dict.get("bounds"),
+                title=str(window_dict.get("title") or window_dict.get("name") or ""),
+                process_name=str(window_dict.get("process_name") or ""),
+                state="ready",
+            )
+
+        payload = {
+            "ok": True,
+            "found": True,
+            "app": app_name,
+            "state": state,
+            "state_before": state_before,
+            "ready": bool(state in ("visible", "minimized") and (activated or not require_foreground)),
+            "hwnd": int(activated_hwnd or resolved_hwnd),
+            "window": window_dict,
+            "activated": activated,
+            "cached": cached,
+            "launch": launch_info,
+            "timing": timing,
+            "reachable": reachable,
+            "covered_by": act.get("covered_by"),
+            "hint": str(act.get("hint") or ""),
+            "degraded": degraded,
+            "degraded_reason": degraded_reason,
+            "candidates": candidates,
+            "multi_instance": len(pool) > 1,
+            "detail": str(act.get("detail") or ""),
+        }
+        if audit is not None:
+            audit.log_ensure(
+                app=app_name,
+                state=state,
+                hwnd=int(activated_hwnd or resolved_hwnd),
+                activated=activated,
+                activated_hwnd=int(activated_hwnd or resolved_hwnd),
+                cached=cached,
+                ensure_ms=round(total_ms, 3),
+                timing=timing,
+                reachable=reachable,
+                covered=bool(covered),
+                candidates_count=len(candidates),
+                degraded=degraded,
+                degraded_reason=degraded_reason,
+                detail=payload["detail"],
+            )
+        return payload
+
+    def _ensure_app_legacy(
+        self,
+        app_name: str,
+        resolved_hwnd: int,
+        title: Optional[str],
+        process_name: Optional[str],
+        restore: bool,
+        snapshot_ms: float,
+        started: float,
+        audit: Any,
+    ) -> Dict[str, Any]:
+        """``UIAGENT_ENSURE_V2=0`` 的回退链路：``find_window`` + ``activate_window``（P0 语义）。"""
+        if not resolved_hwnd:
+            total_ms = (time.perf_counter() - started) * 1000.0
+            payload = {
+                "ok": False,
+                "found": False,
+                "activated": False,
+                "app": app_name,
+                "state": "not_running",
+                "hwnd": 0,
+                "cached": False,
+                "degraded": True,
+                "degraded_reason": "app_not_running",
+                "fallback": "legacy",
+                "timing": {"snapshot_ms": round(snapshot_ms, 3), "total_ms": round(total_ms, 3)},
+                "detail": "未找到应用窗口（回退链路 UIAGENT_ENSURE_V2=0）",
+            }
+            if audit is not None:
+                audit.log_ensure(
+                    app=app_name,
+                    state="not_running",
+                    hwnd=0,
+                    activated=False,
+                    ensure_ms=round(total_ms, 3),
+                    degraded=True,
+                    degraded_reason="app_not_running",
+                    detail=payload["detail"],
+                )
+            return payload
+        result = (
+            self.activate_window(
+                title=title, process_name=process_name, hwnd=resolved_hwnd, restore=restore
+            )
+            or {}
+        )
+        total_ms = (time.perf_counter() - started) * 1000.0
+        result.update(
+            {
+                "ok": bool(result.get("activated")),
+                "app": app_name,
+                "state": "unknown",
+                "cached": False,
+                "degraded": not bool(result.get("activated")),
+                "degraded_reason": "" if result.get("activated") else "activate_failed",
+                "fallback": "legacy",
+                "timing": {"snapshot_ms": round(snapshot_ms, 3), "total_ms": round(total_ms, 3)},
+            }
+        )
+        return result
+
+    # ============================================================ P2：未启动路径 + 就绪等待
+    def launch_app(
+        self,
+        app: str,
+        args: str = "",
+        working_dir: str = "",
+        method: str = "auto",
+        dry_run: bool = False,
+        timeout: Optional[float] = None,
+        wait: bool = True,
+    ) -> Dict[str, Any]:
+        """解析启动入口 → 启动进程 → 按 PID 等待窗口就绪（P2 改动点 #13，**写操作**）。
+
+        薄封装 :class:`uiagent.launcher.AppLauncher`：解析链与白名单校验都在 launcher 内，
+        controller 只负责转发，避免两处规则漂移。``dry_run=True`` 时不产生进程。
+        """
+        from .launcher import get_launcher
+
+        return get_launcher().launch(
+            app,
+            args=args,
+            working_dir=working_dir,
+            method=method,
+            dry_run=dry_run,
+            timeout=timeout,
+            wait=wait,
+        )
+
+    def resolve_app(self, app: str) -> Dict[str, Any]:
+        """只解析应用启动入口（别名 / 注册表 / 开始菜单 / UWP），**只读**，不启动任何进程。"""
+        from .launcher import get_launcher
+
+        return get_launcher().resolve(app)
+
+    def wait_app_window(
+        self,
+        pid: int = 0,
+        hwnd: int = 0,
+        app: str = "",
+        timeout: float = 10.0,
+        stable_ms: float = 150.0,
+    ) -> Dict[str, Any]:
+        """等待目标窗口出现并完成布局（P2 改动点 #13，**只读**）；超时返回 ``state="launching"``。"""
+        from .launcher import app_match_keys, get_launcher
+
+        return get_launcher().wait_window(
+            pid=pid,
+            hwnd=hwnd,
+            app=app_match_keys(app) if (app and not pid and not hwnd) else app,
+            timeout=timeout,
+            stable_ms=stable_ms,
+        )
+
+    def app_status(
+        self,
+        apps: Optional[Sequence[Any]] = None,
+        include_not_running: bool = True,
+    ) -> Dict[str, Any]:
+        """批量查询应用状态（改动点 #6，**只读**）：返回每个应用的 S1~S4 状态与候选窗口。
+
+        ``apps`` 留空时实时枚举全部「像应用窗口」的顶层窗口，按应用别名分组各取一个最优窗口。
+        """
+        from .accessibility import win32_windows as w32
+
+        started = time.perf_counter()
+        audit = get_audit_logger()
+        names = [str(item).strip() for item in (apps or []) if str(item).strip()]
+        items: List[Dict[str, Any]] = []
+        if names:
+            for name in names:
+                entry = self._ctx_lookup(name)
+                pool = self._app_pool(name)
+                item = self._app_status_item(name, pool, cached=entry is not None)
+                if entry is not None:
+                    item["cached_hwnd"] = int(entry.hwnd)
+                    item["cached_age_ms"] = round(entry.age() * 1000.0, 1)
+                items.append(item)
+        else:
+            buckets: Dict[str, List[Any]] = {}
+            for win in w32.app_windows():
+                key = str(win.app_alias or win.process_name or win.title or win.hwnd)
+                buckets.setdefault(key, []).append(win)
+            for key in sorted(buckets):
+                if key.strip().lower() in ("", "none"):
+                    continue
+                items.append(self._app_status_item(key, buckets[key], cached=False))
+        if not include_not_running:
+            items = [item for item in items if item.get("state") != "not_running"]
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        payload = {
+            "ok": True,
+            "count": len(items),
+            "apps": items,
+            "elapsed_ms": round(elapsed_ms, 3),
+            "context": self._ctx.stats(),
+        }
+        if audit is not None:
+            audit.log_action(
+                "app_status",
+                count=len(items),
+                apps=[str(item.get("app") or "") for item in items],
+                elapsed_ms=round(elapsed_ms, 3),
+            )
+        return payload
+
+    @staticmethod
+    def _app_status_item(app: str, pool: Sequence[Any], cached: bool = False) -> Dict[str, Any]:
+        """单个应用的状态条目：最优候选窗口 + S1~S4 状态 + 多实例候选列表。"""
+        from .accessibility import win32_windows as w32
+
+        best = w32.select_best_window(pool) if pool else None
+        if best is None:
+            return {
+                "app": app,
+                "state": "not_running",
+                "hwnd": 0,
+                "window": None,
+                "foreground": False,
+                "cached": cached,
+                "multi_instance": False,
+                "candidates": [],
+            }
+        foreground_hwnd = int(w32.get_foreground_hwnd() or 0)
+        return {
+            "app": app,
+            "state": w32.window_state(best),
+            "hwnd": int(best.hwnd),
+            "window": best.to_dict(),
+            "foreground": int(best.hwnd) == foreground_hwnd,
+            "cached": cached,
+            "multi_instance": len(pool) > 1,
+            "candidates": [
+                {
+                    "hwnd": int(win.hwnd),
+                    "title": str(win.title or ""),
+                    "process_name": str(win.process_name or ""),
+                    "state": w32.window_state(win),
+                    "selected": int(win.hwnd) == int(best.hwnd),
+                }
+                for win in list(pool)[:8]
+            ],
+        }
 
     # ============================================================ 写操作
     def click(

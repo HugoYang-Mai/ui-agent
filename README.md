@@ -13,7 +13,7 @@ AIGC:
 
 基于 **Windows UI Automation（UIA）+ RapidOCR（CPU）** 的鼠标定位与界面操控内核。
 
-定位策略为三级降级：**UIA 精确定位 → OCR 文字定位兜底 → 返回失败**。内核已通过 **MCP Server（stdio 传输）** 对外暴露 8 个 `ui_*` 工具，可供 CowAgent / Marvis 等 MCP 客户端直接接入；接入配置、工具参数与协议自测结论见 [`docs/mcp-server.md`](docs/mcp-server.md)；审计日志（调用链 / 定位方式 / 写操作明细）设计见 [`docs/audit-log-design.md`](docs/audit-log-design.md)。
+定位策略为三级降级：**UIA 精确定位 → OCR 文字定位兜底 → 返回失败**。内核已通过 **MCP Server（stdio 传输）** 对外暴露 12 个 `ui_*` 工具，可供 CowAgent / Marvis 等 MCP 客户端直接接入；接入配置、工具参数与协议自测结论见 [`docs/mcp-server.md`](docs/mcp-server.md)；审计日志（调用链 / 定位方式 / 写操作明细）设计见 [`docs/audit-log-design.md`](docs/audit-log-design.md)。
 
 窗口识别采用 **Win32 `EnumWindows` + UIA 双层**：隐藏 / 最小化到托盘的窗口同样可枚举，并可按 `hwnd` / 进程名 / 窗口类名 / 标题定位与激活，未命中时返回可执行的排查建议（详见第 7 节）；全部调用与写操作自动落审计日志（详见第 8 节）。
 
@@ -73,7 +73,9 @@ D:\Projects\ui-agent\
 │   ├── logging_utils.py                 # 运行日志（全部走 stderr，stdout 只承载结构化结果）
 │   ├── audit.py                         # 审计日志：JSONL 落盘、输入文本脱敏、run 归组、统计 / 跟读 / 回放
 │   ├── controller.py                    # UniversalController：统一门面（定位 / 点击 / 输入 / 窗口 / 审计埋点）
-│   ├── mcp_server.py                    # MCP Server：8 个 ui_* 工具 + COM 专用线程调度 + tool_call/tool_result 埋点
+│   ├── mcp_server.py                    # MCP Server：12 个 ui_* 工具 + COM 专用线程调度 + tool_call/tool_result/ensure/launch 埋点
+│   ├── launcher.py                      # P2 启动链路：resolve / launch / wait_window（白名单 + dry_run + 别名表）
+│   ├── apps.yaml                        # P2 别名表（别名 → 可执行路径 / AUMID / 分级），可选、可删
 │   ├── accessibility\
 │   │   ├── win32_windows.py             # Win32 ctypes 层：EnumWindows 全量枚举、进程名 / 应用别名标注、置前与遮挡探测
 │   │   └── windows_uia.py               # WindowsAccessibility：UIA 查询 + 窗口查找 / 激活（委托 Win32 层）
@@ -148,6 +150,14 @@ ctrl.locate("确定")                       # LocateResult(source='uia'|'ocr', c
 ctrl.find_window(title="记事本")           # 也支持 process_name / class_name / hwnd
 ctrl.window_from_hwnd(hwnd)               # 按句柄构造窗口元素（懒加载 UIA 原生控件）
 ctrl.activate_window(hwnd=hwnd, show_hidden=True)   # 置前，可唤醒隐藏 / 托盘窗口
+ctrl.ensure_app(app="微信")               # P1 统一入口：状态判定(S1~S4) → 唤醒 → 就绪确认 → 置前
+ctrl.app_status(["微信", "记事本"])        # P1 只读：批量状态查询（visible/minimized/hidden/not_running）
+
+# ---- 启动能力（P2；写操作，受 UIAGENT_LAUNCH_ENABLED / UIAGENT_LAUNCH_ALLOWLIST 约束）----
+ctrl.resolve_app("计算器")                 # 只读：只解析入口（alias_table → 注册表 App Paths → PATH → 开始菜单 → UWP）
+ctrl.launch_app("计算器", dry_run=True)    # 预演：只解析、不产生任何进程
+ctrl.launch_app("记事本", timeout=15.0)    # 启动 + 等窗口就绪 → pid / hwnd / resolved_by / launch_ms / wait_ms
+ctrl.wait_app_window("记事本", timeout=5.0) # 只等窗口就绪（pid / app 双线索，含打包应用别名兜底）
 
 from uiagent.controller import window_miss_report
 window_miss_report(title="微信")           # 未命中时返回 hints + candidates + hidden_apps 诊断
@@ -159,6 +169,15 @@ ctrl.hotkey("ctrl", "s")
 ```
 
 审计日志（`uiagent/audit.py`）：默认开启，JSONL 落盘 `logs\`；输入文本默认只落长度 + 摘要 + 掩码预览。
+
+启动链路（P2，改动点 #16）环境开关：
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `UIAGENT_LAUNCH_ENABLED` | `1` | 启动能力总开关；设 `0` 时 `resolve_app`（只读解析）仍可用，但 `launch_app` / `ui_launch_app` 一律拒绝（`degraded_reason=launch_disabled`，含 `dry_run`）；`ui_wait_window` 属只读等待，**不受**该开关限制 |
+| `UIAGENT_LAUNCH_ALLOWLIST` | 空 | 允许启动的白名单（逗号分隔，别名 / 目标文件名，大小写不敏感）；空 = 不校验；非空时不在名单内 → `degraded_reason=not_allowlisted` 并落审计告警 |
+
+> 两者**均为进程启动前置校验**：拒绝路径已用 `tasklist` 前后快照验证零进程产生（见第 7 节）。`resolve_app` 是只读解析，不受开关限制，可随时用于预演（等价于 `dry_run=true`）。
 
 ```python
 from uiagent import audit
@@ -207,10 +226,34 @@ audit.record_text_policy()   # 文本策略：mask / hash / full
 | 定位方式 | `find_window(title=…) / process_name=… / class_name=… / hwnd=…`；标题支持子串匹配与别名匹配 |
 | 未命中诊断 | 返回 `hints`（可执行排查建议）与 `candidates`（疑似候选窗口，含别名 / 进程名 / 类名）；Python 侧可用 `window_miss_report(...)` 单独获取 |
 | 激活 | `activate_window(hwnd=…, restore=True, show_hidden=True)`：最小化先还原、隐藏 / 托盘先 `ShowWindow` 唤醒，再用 `AttachThreadInput` 绕过前台锁定 |
+| 四状态唤起（P1） | `ensure_app(app=…)` / `ui_app_ensure` 按状态分层：S1 `visible` 直接置前（零等待）、S2 `minimized` 走 `SW_RESTORE` + bounds 稳定等待、S3 `hidden` 走 `SW_SHOW` + bounds 稳定等待；S4 未运行如实上报并返回 `candidates`，且可交由 P2 启动链路自动接管；`UIAGENT_ENSURE_V2=0` 可回退 `find_window` + `activate_window` 旧链路（`fallback="legacy"`：命中窗口 `state="unknown"`、未命中不带 `candidates`），已用同一窗口实测开关差分 |
+| 启动未运行应用（P2） | `resolve_app` / `launch_app` / `wait_app_window`（MCP：`ui_launch_app` / `ui_wait_window`）：解析链 `apps.yaml` 别名表 → 注册表 `App Paths` → `PATH` → 开始菜单 `.lnk` → UWP AUMID（Win 键搜索兜底本版本未实现）；`dry_run=True` 只预演不产生进程；`UIAGENT_LAUNCH_ENABLED=0` 一键禁用，`UIAGENT_LAUNCH_ALLOWLIST` 非空时严格校验；解析出多候选**不自动启动**（返回 `candidates` 由上层指定） |
 | 遮挡诊断 | `probe_window_cover` 判断目标点是否被置顶窗口盖住（返回 `covered` / `covered_by` / `hint`）；坐标点击前自动**临时抬升**目标窗口 Z 序（`ensure_reachable`），点击后立即 `restore_after_boost` 复原，并在结果中返回 `auto_raise` / `hit_window` |
 | 性能 | 枚举阶段纯本地构造、不触碰 UIA（避免跨进程 COM 阻塞），仅在激活 / 定位具体窗口时按 `hwnd` 懒加载原生控件 |
 
-本机实测（2026-09-15）：`list_windows()` 返回 19 个窗口（7 可见 / 12 隐藏），单次耗时约 10 ms；隐藏窗口带 `visible=false` 与 `app_alias`，可按 `hwnd` 激活。
+本机实测（2026-09-15）：`list_windows()` 返回 19 个窗口（7 可见 / 12 隐藏），单次耗时约 10 ms；隐藏窗口带 `visible=false` 与 `app_alias`，可按 `hwnd` 激活。P1 `ensure_app` 四状态实测（记事本，每状态 8 轮采样）：S1 `visible` P50 10.3 ms / P95 14.2 ms、S2 `minimized` P50 195.6 ms / P95 208.7 ms、S3 `hidden` P50 181.4 ms / P95 183.3 ms，均在 150 / 650 / 900 ms 预算内；S4 未运行 P50 43.0 ms（返回 8 个 `candidates`，不启动进程）。
+
+P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → 等窗口就绪"完整链路，`cold_ms = launch_ms + wait_ms`）：
+
+| 应用 | 解析档位 | `launch_ms` | `wait_ms` | `cold_ms` | 窗口匹配 | 结果 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 记事本 `notepad.exe` | `alias_table` | 54.6 ms | 973.0 ms | **1027.6 ms**（wall 1029.6） | `app_fallback` | `state=visible`，`hwnd=2034674`，`ui_app_ensure` 命中同一 `hwnd`（10.3 ms） |
+| 计算器 `计算器` → `calc.exe`+AUMID | `alias_table` | 23.4 ms | 1021.7 ms | **≈1045 ms** | `app_fallback` | `state=visible`，`hwnd=393928`，`ui_wait_window(app)` 187 ms |
+| 画图 `画图` → `mspaint.exe` | `alias_table` | 90.1 ms | 494.6 ms | **≈585 ms** | `pid` | `state=visible`，`hwnd=264218`，`ui_wait_window(app)` 163 ms |
+
+三个轻量应用均落入方案 4.2 轻量级 SLA（≤1.5 s），`launch_ms` 均 ≤300 ms（S4 发起段预算）。注意：计算器 / 画图（Store 打包应用）的可见窗口多数归 `ApplicationFrameHost.exe`，仅按 `pid` 匹配不到，由别名表兜底键命中（`matched_by=app_fallback`、`fallback=true`，`degraded_reason=pid_window_missing`），这也是 `ui_wait_window` 支持 `app` 线索的原因。
+
+解析链分段实测（同为 2026-09-15）：`apps.yaml` 别名表首次调用 11.8 ms（承担表加载）、缓存命中 0.009~0.029 ms；开始菜单 128 项 `.lnk` 首次冷索引 2.1 ms、TTL 300 s 内缓存命中 0.002 ms；其他来源 `regedit`（`app_paths`）0.58 ms、`任务管理器`（`uwp`）2.79 ms、`powershell.exe`（`alias_table`）0.02 ms；未安装应用（`chrome` / `winword`）走完全链返回 `ok=false` + `hint`（`chrome` 388 ms），均无残留进程。
+
+启动安全闸验证（逐项比对 `tasklist` 前后快照，断言**零进程产生**）：
+
+| 用例 | 环境 | 结果 |
+| --- | --- | --- |
+| 开关禁用 + 真实启动请求 | `UIAGENT_LAUNCH_ENABLED=0` | `ok=false` / `pid=0` / `degraded_reason=launch_disabled` / 无进程 |
+| 开关禁用 + `dry_run` | 同上 | 同上（`dry_run` 也不放行） |
+| 白名单不匹配 + 真实启动请求 | `UIAGENT_LAUNCH_ALLOWLIST=notepad.exe`，请求 `计算器` | `ok=false` / `degraded_reason=not_allowlisted` / 无进程 |
+| 白名单匹配 → 放行 | `ALLOWLIST=notepad.exe`，请求 `记事本` | `ok=true` / `state=dry_run`（预演） |
+| 白名单大小写不敏感 | `ALLOWLIST=NOTEPAD`，请求 `notepad.exe` | `ok=true` / `state=dry_run`（误拒为 0） |
 
 ---
 
@@ -219,9 +262,9 @@ audit.record_text_policy()   # 文本策略：mask / hash / full
 设计文档：[`docs/audit-log-design.md`](docs/audit-log-design.md)。用途：记录"谁在何时调用了什么、用了哪种定位方式、点了哪里、命中了哪个窗口"，便于调试与回归分析。**不改变任何工具签名与返回结构**，不写 stdout。
 
 - 载体：`uiagent/audit.py`，JSONL 落盘 `logs\audit-YYYYMMDD-<pid>.jsonl`（`logs\` 已 gitignore）；单文件超 10 MB 轮转为 `<同名>.1`，启动时清理超过保留天数的旧文件。
-- 六类事件：`tool_call` / `tool_result`（MCP 层，覆盖全部 8 个工具）、`locate`（定位明细：`source=uia|ocr|coords`、`fallback`、`uia_ms` / `ocr_ms`、候选数）、`action`（写操作：点击坐标、`hit_window`、`auto_raise`、输入摘要）、`run_start` / `run_end`（按静默间隔切分的任务回放单元）。
+- 八类事件：`tool_call` / `tool_result`（MCP 层，覆盖全部 12 个工具）、`locate`（定位明细：`source=uia|ocr|coords`、`fallback`、`uia_ms` / `ocr_ms`、候选数，以及 P0 的 `scope` / `scope_hwnd` / `cached`）、`ensure`（P1 应用唤起：`app` / `state` / `hwnd` / `activated` / `cached` / `ensure_ms` / `timing` / `degraded` / `degraded_reason`）、`launch`（P2 启动链路，已落盘：`app` / `resolved_by` / `target_path` / `pid` / `launch_ms` / `wait_ms` / `dry_run` / `degraded_reason`；被开关或白名单拒绝时同样落盘 `degraded_reason`）、`action`（写操作：点击坐标、`hit_window`、`auto_raise`、输入摘要）、`run_start` / `run_end`（按静默间隔切分的任务回放单元）。
 - 脱敏（默认 `mask`）：只落 `input_len` + `input_sha256[:8]` + 首字符掩码预览（如 `老***`），**不落明文**；`hash` 只留长度与摘要，`full` 仅本地深度调试时使用。
-- 埋点仅 3 处：`mcp_server.py` 的 `_guard`、`controller.py` 的 `locate()` / `locate_many()`、`controller.py` 的写操作方法（`click` / `type_text` / `type_chinese` / `hotkey` / `activate_window`）。
+- 埋点：`mcp_server.py` 的 `_guard`、`controller.py` 的 `locate()` / `locate_many()`、`controller.py` 的 `ensure_app()`（P1 新增 `ensure` 事件）、`controller.py` 的 `launch_app()` / `wait_app_window()`（P2 新增 `launch` 事件）、`controller.py` 的写操作方法（`click` / `type_text` / `type_chinese` / `hotkey` / `activate_window`）。
 
 环境变量：
 
@@ -240,7 +283,7 @@ audit.record_text_policy()   # 文本策略：mask / hash / full
 .\.venv\Scripts\python.exe -X utf8 main.py audit --run 20260915-090847-152884-r1 # 按 run_id 回放调用序列
 ```
 
-验收：`docs/audit-log-design.md` §9 六项标准全部通过（六类事件字段齐全、中文输入无明文、按 8 秒间隔切分 `run_id`、CLI 三档可用、MCP 自测只读 7/7 与含写 14/14 通过、`UI_AGENT_AUDIT=0` 时零文件产生）。本机最近一次 `audit --stats` 实测：69 条记录 / 4 个 session / 6 个 run，六类事件齐全（`tool_call` 19、`tool_result` 19、`locate` 13、`action` 6、`run_start` 6、`run_end` 6），失败 0 次，平均耗时 727 ms。
+验收：`docs/audit-log-design.md` §9 六项标准全部通过（六类事件字段齐全、中文输入无明文、按 8 秒间隔切分 `run_id`、CLI 三档可用、`UI_AGENT_AUDIT=0` 时零文件产生）。P1 后事件类别扩为八类（新增 `ensure`）；P2 后 `launch` 事件由"仅定义契约"转为**真实落盘**（`launch_app` / `wait_app_window`，含被开关 / 白名单拒绝的路径）；MCP 自测 **29/29**（只读 12/12 + 含写 17 项，含 P2 冷启动用例）通过。本机最近一次 `audit --stats` 实测：69 条记录 / 4 个 session / 6 个 run，六类事件齐全（`tool_call` 19、`tool_result` 19、`locate` 13、`action` 6、`run_start` 6、`run_end` 6），失败 0 次，平均耗时 727 ms。
 
 ---
 
@@ -253,6 +296,7 @@ audit.record_text_policy()   # 文本策略：mask / hash / full
 - **窗口标题不可靠**：微信 / QQ 等应用窗口标题是登录昵称，判断归属请用 `app_alias` / `process_name`；定位优先用 `hwnd` / `class_name`。
 - **隐藏窗口不是"未运行"**：只看 `visible=true` 会误判；隐藏 / 托盘窗口在列表中 `visible=false`，可用 `hwnd` 唤醒激活。
 - **置顶窗口遮挡**：置顶窗口会盖住同区域普通窗口；`activate_window` 返回 `covered` / `covered_by` / `hint`，`click` 会自动临时抬升目标窗口并返回 `auto_raise` / `hit_window`。
+- **启动能力（P2）会真实拉起进程**：`ui_launch_app` / `ui_wait_window` 默认启用（`UIAGENT_LAUNCH_ENABLED=1`）；`UIAGENT_LAUNCH_ENABLED=0` 时整条链路直接拒绝（`degraded_reason=launch_disabled`，含 `dry_run`）；`UIAGENT_LAUNCH_ALLOWLIST` 非空时只允许白名单内的别名 / 目标文件名（拒绝时 `degraded_reason=not_allowlisted`）。建议先用 `dry_run=true` 预演解析结果再真实启动。`ensure_app` / `ui_app_ensure` 自身不启动进程，`launch_if_missing=true` 才交由启动链路接管；`degraded=true` 表示未达最优就绪状态而非失败。
 - **审计日志本地落盘**：`logs\audit-*.jsonl` 含调用参数（已脱敏）与窗口信息，敏感环境用 `UI_AGENT_AUDIT=0` 关闭。
 - **CLI stdout 为结构化 JSON**，日志走 stderr，便于 MCP Server 直接以子进程方式包裹。
 
@@ -268,8 +312,12 @@ audit.record_text_policy()   # 文本策略：mask / hash / full
 
 | 工具 | 类型 | 作用 |
 | --- | --- | --- |
-| `ui_window_list` | 只读 | 枚举顶层窗口 + 环境快照；按应用聚合 `apps[]`，并给出 `hidden_windows[]` / `topmost_windows[]`；每项带 `hwnd` / `visible` / `iconic` / `app_alias` / `class_name` / `process_name` |
-| `ui_activate_window` | 写 | 按 `hwnd` / 标题（含应用别名）/ `process_name` 定位并置前，可还原最小化、唤醒隐藏 / 托盘窗口；未命中返回 `hints` + `candidates`，命中后附遮挡诊断 `covered` / `covered_by` |
+| `ui_window_list` | 只读 | 枚举顶层窗口 + 环境快照；按应用聚合 `apps[]`（带 `state` / `states`），并给出 `hidden_windows[]` / `topmost_windows[]`；每项带 `hwnd` / `visible` / `iconic` / `state` / `app_alias` / `class_name` / `process_name` |
+| `ui_activate_window` | 写 | 按 `hwnd` / 标题（含应用别名）/ `process_name` 定位并置前，可还原最小化、唤醒隐藏 / 托盘窗口（`wait_ready` 控制唤醒后是否等 bounds 稳定）；未命中返回 `hints` + `candidates`，命中后附遮挡诊断 `covered` / `covered_by` + `state` / `timing` |
+| `ui_app_ensure` | 写 | 统一应用唤起入口（P1）：S1~S4 状态判定 → 唤醒 / 就绪等待 → 置前，返回 `state` / `state_before` / `ready` / `timing` / `reachable`；S4 返回 `candidates`，`launch_if_missing=true` 时由 P2 启动链路自动冷启动 |
+| `ui_app_status` | 只读 | 批量查询应用状态（`visible` / `minimized` / `hidden` / `cloaked` / `not_running`）+ 候选窗口与 `AppContext` 缓存信息 |
+| `ui_launch_app` | 写 | 启动应用并等窗口就绪（P2，**高风险：真实创建进程**）：解析链 `apps.yaml` 别名表 → 注册表 `App Paths` → `PATH` → 开始菜单 `.lnk` → UWP；返回 `state` / `hwnd` / `pid` / `resolved_by` / `target_path` / `launch_ms` / `wait_ms`；`dry_run=true` 只预演；`launch_method=auto\|exec\|process\|uwp`；超时返回 `state="launching"`（非失败） |
+| `ui_wait_window` | 只读 | 等待窗口出现并完成布局（P2）：三选一定位 `hwnd` > `pid` > `app`（`app` 支持别名 / 进程名，含打包应用兜底键），返回 `state` / `waited_ms` / `stable`；替代上层"睡眠 + 反复轮询" |
 | `ui_find` | 只读 | 定位元素或界面文字（UIA → OCR 兜底） |
 | `ui_click` | 写 | 定位式点击或坐标点击；目标点被置顶窗口遮挡时自动临时抬升目标窗口，返回 `auto_raise` / `hit_window` |
 | `ui_type` | 写 | 输入文本（中文自动走剪贴板） |
@@ -286,7 +334,7 @@ audit.record_text_policy()   # 文本策略：mask / hash / full
 .\.venv\Scripts\python.exe -X utf8 selfcheck\mcp_selfcheck.py --include-write # 追加记事本端到端
 ```
 
-最近实测：`initialize` 握手 `2025-11-25`、`tools/list` 返回全部 8 个工具、`tools/call` 覆盖只读与写链路，**14/14 检查通过（passed=true，16.08 s）**。
+最近实测（2026-09-15）：`initialize` 握手 `2025-11-25`、`tools/list` 返回全部 12 个工具、`tools/call` 覆盖只读与写链路（含 P1 四状态用例与 P2 冷启动用例），**29/29 检查通过（passed=true，18.90 s）**；只读链路单独跑 **12/12（passed=true，7.05 s）**。P2 冷启动段实测（MCP 真实链路，记事本）：`ui_launch_app` `launch_ms=52.2` / `wait_ms=966.4`（`cold_ms=1018.6`，轻量级 SLA ≤1.5 s 通过）、`state=visible` / `hwnd=7473518` / `resolved_by=alias_table`；随后 `ui_app_ensure` 命中同一 `hwnd`（10.1 ms），`ui_wait_window(pid+app)` 698.1 ms 命中；`ui_launch_app(dry_run=true)`（`pid=0`）与 `ui_wait_window` 超时（返回 `state=launching`）均在只读链路断言通过。P1 `ui_app_ensure` 四状态实测（记事本，8 轮采样）：S1 `visible` P50 10.3 ms / P95 14.2 ms、S2 `minimized` P50 195.6 ms / P95 208.7 ms、S3 `hidden` P50 181.4 ms / P95 183.3 ms，均在 150 / 650 / 900 ms 预算内；S4 未启动 P50 43.0 ms，返回 8 个 `candidates` 与 `degraded_reason=app_not_running`。
 
 完整接入配置、逐工具参数表与故障排查见 [`docs/mcp-server.md`](docs/mcp-server.md)。
 *（内容由AI生成，仅供参考）*

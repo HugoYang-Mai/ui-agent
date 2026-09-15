@@ -36,6 +36,15 @@ def _force_foreground(hwnd: int, restore: bool = True, attempts: int = 3) -> boo
     return _w32.force_foreground(hwnd, restore=restore, attempts=attempts)
 
 
+def _bounds_ready(hwnd: int) -> bool:
+    """窗口 bounds 是否已非空（宽高 > 0）——``wait_ready`` 的触发前置判断（P1 改动点 #9）。"""
+    try:
+        rect = _w32.get_window_rect(int(hwnd or 0))
+    except Exception:  # pragma: no cover - 查询失败按"未就绪"处理
+        return False
+    return bool(rect and int(rect[2]) > 0 and int(rect[3]) > 0)
+
+
 def win32_to_element(win: Any) -> UIElement:
     """``Win32Window`` → :class:`UIElement`（窗口列表统一输出格式）。
 
@@ -418,13 +427,20 @@ class WindowsAccessibility(AccessibilityBase):
         hwnd: Optional[int] = None,
         restore: bool = True,
         show_hidden: bool = True,
+        wait_ready: bool = True,
     ) -> Dict[str, Any]:
         """把窗口置为前台（写操作：仅改变 Z 序，必要时还原最小化 / 显示隐藏窗口）。
 
         三种定位方式：``hwnd`` 直给 / ``target`` 传 UIElement（或原生控件、整数句柄）。
         隐藏或最小化到托盘的窗口会先 ``SW_SHOW`` / ``SW_RESTORE`` 再置前。
 
-        :return: ``{"activated", "hwnd", "window", "foreground_hwnd", "show", "detail"}``
+        P1（改动点 #9）：``wait_ready=True`` 时在"显示之后、置前之前"确认 bounds 已稳定
+        （连续采样尺寸差 ≤2 px），避免"刚 ``SW_SHOW`` 完就点击"落到未完成布局的窗口；
+        bounds 未稳定按**降级**处理（``degraded_reason="window_unstable"``），不抛异常。
+        已可见且 bounds 完整的窗口（S1）不会产生等待开销。
+
+        :return: ``{"activated", "hwnd", "window", "foreground_hwnd", "show", "state",
+            "timing"{show_ms, settle_ms, foreground_ms, total_ms}, "stable", "detail"}``
         """
         result: Dict[str, Any] = {"activated": False, "hwnd": 0, "detail": ""}
 
@@ -464,7 +480,34 @@ class WindowsAccessibility(AccessibilityBase):
             show_state = _w32.show_window(handle)
             result["show"] = show_state
 
+        # P1（改动点 #9）：状态切换（SW_RESTORE / SW_SHOW）往往伴随窗口重排，先确认 bounds
+        # 稳定再置前，避免上层紧接着的定位/点击落到未完成布局的窗口上。S1 已就绪窗口零开销。
+        timing: Dict[str, Any] = {
+            "show_ms": round(float(show_state.get("waited_ms") or 0.0), 3),
+            "settle_ms": 0.0,
+            "foreground_ms": 0.0,
+            "total_ms": 0.0,
+        }
+        result["stable"] = True
+        if wait_ready and (show_state.get("shown") or not _bounds_ready(handle)):
+            settle_started = time.perf_counter()
+            settle = _w32.wait_bounds_stable(handle)
+            timing["settle_ms"] = round((time.perf_counter() - settle_started) * 1000.0, 3)
+            result["stable"] = bool(settle.get("stable"))
+            result["bounds"] = settle.get("bounds")
+            result["settle_samples"] = settle.get("samples")
+            if not result["stable"]:
+                result["degraded"] = True
+                result["degraded_reason"] = str(settle.get("degraded_reason") or "window_unstable")
+
+        foreground_started = time.perf_counter()
         ok = _w32.force_foreground(handle, restore=restore)
+        timing["foreground_ms"] = round((time.perf_counter() - foreground_started) * 1000.0, 3)
+        timing["total_ms"] = round(
+            timing["show_ms"] + timing["settle_ms"] + timing["foreground_ms"], 3
+        )
+        result["timing"] = timing
+        result["state"] = _w32.window_state(hwnd=handle)
         result["activated"] = bool(ok)
         result["foreground_hwnd"] = _w32.get_foreground_hwnd()
         if ok:

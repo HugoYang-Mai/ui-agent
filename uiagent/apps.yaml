@@ -1,0 +1,65 @@
+# uiagent/apps.yaml —— 启动别名表（P2 改动点 #14）
+#
+# 作用：把「应用别名 / 中文名 / exe 名」显式映射到可执行入口，作为启动解析链的第一档
+#      （alias_table → app_paths → start_menu → uwp → search_fallback）。
+# 说明：
+#   * 本文件**可选**：删除后解析链会自动退回到内置兜底别名（notepad / calc / mspaint / explorer）
+#     与注册表 App Paths、开始菜单、UWP 四档，启动能力不受影响。
+#   * `path` 可以是绝对路径，也可以是 PATH 中可解析的名称（如 notepad.exe）。
+#   * `aliases` 为该入口的全部等价叫法（大小写不敏感，`.exe` 后缀可省略）。
+#   * `args` 为附加启动参数（默认空）；`appid` 为 UWP/商店应用 AUMID（优先于 path 时用
+#     launcher 的 launch_method=uwp 启动）。
+#   * `tier` ∈ light / normal / heavy，仅用于选择 `ui_wait_window` 的默认超时（8/15/25 s），
+#     不影响解析结果。
+#
+# 安全：新增条目等于放开一个可启动目标；如已设置 UIAGENT_LAUNCH_ALLOWLIST，
+#      还要保证别名 / 目标文件名在白名单内，否则启动会被拒绝（方案 RF6）。
+version: 1
+
+apps:
+  notepad:
+    id: notepad
+    aliases: [notepad, notepad.exe, 记事本]
+    path: notepad.exe
+    tier: light
+
+  calc:
+    id: calc
+    aliases: [calc, calc.exe, calculator, 计算器]
+    path: calc.exe
+    appid: Microsoft.WindowsCalculator_8wekyb3d8bbwe!App
+    tier: light
+
+  mspaint:
+    id: mspaint
+    aliases: [mspaint, mspaint.exe, paint, 画图]
+    path: mspaint.exe
+    tier: light
+
+  explorer:
+    id: explorer
+    aliases: [explorer, explorer.exe, 资源管理器, 文件资源管理器]
+    path: explorer.exe
+    tier: normal
+
+  cmd:
+    id: cmd
+    aliases: [cmd, cmd.exe, 命令提示符]
+    path: cmd.exe
+    tier: normal
+
+  powershell:
+    id: powershell
+    aliases: [powershell, powershell.exe, 终端, windows终端]
+    path: powershell.exe
+    tier: normal
+
+  # 以下为「已安装即生效」的常见应用示例，可按需增删；未安装时解析会落到后续档位：
+  # msedge:
+  #   aliases: [msedge, msedge.exe, edge, 浏览器]
+  #   path: msedge.exe
+  #   tier: normal
+  # wechat:
+  #   aliases: [wechat, weixin, 微信]
+  #   path: C:\Program Files\Tencent\WeChat\WeChat.exe
+  #   tier: heavy

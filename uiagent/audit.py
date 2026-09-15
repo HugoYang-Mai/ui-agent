@@ -47,8 +47,14 @@ DEGRADED_REASONS = (
     "scope_window_unresolved",  # 显式要求窗口限定但解析不到窗口句柄
     "scope_upgrade_desktop",    # 窗口内未命中 → 升级为桌面级搜索（RF1 兜底）
     "window_not_found",         # 目标窗口不存在
+    "window_unstable",          # 窗口已显示但 bounds 未在超时内稳定（RF10）
     "launch_search_fallback",   # 启动入口走开始菜单兜底（P2）
     "launch_timeout",           # 启动后等待窗口超时（P2）
+    "pid_window_missing",       # 启动进程（打包应用启动桩）不持有窗口，已按应用名兜底命中（P2）
+    "launch_disabled",          # 启动能力被 UIAGENT_LAUNCH_ENABLED=0 禁用（P2，RF6）
+    "launch_failed",            # 启动调用本身失败（P2）
+    "not_allowlisted",          # 应用不在 UIAGENT_LAUNCH_ALLOWLIST 白名单内（P2，RF6）
+    "ambiguous_candidates",     # 解析/匹配出多个候选，不自动选择（RF5）
 )
 
 

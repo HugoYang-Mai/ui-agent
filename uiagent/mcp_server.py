@@ -271,6 +271,20 @@ async def _guard(
 
 
 # ===================================================================== 内核操作实现
+#: 应用状态优先级（用于 apps[] 聚合状态的择优选值）
+_STATE_ORDER = ("visible", "minimized", "hidden", "cloaked", "not_running", "unknown")
+
+
+def _window_state_of(hwnd: Any) -> str:
+    """单个 hwnd 的窗口状态（P1 改动点 #11）；异常时降级为 ``unknown``，绝不抛错。"""
+    try:
+        from .accessibility import win32_windows as w32
+
+        return str(w32.window_state(hwnd=int(hwnd or 0)) or "unknown")
+    except Exception:  # noqa: BLE001 - 状态字段属增强信息，失败不影响窗口枚举
+        return "unknown"
+
+
 def _op_window_list(ctrl: Any, include_invisible: bool, limit: int, only_windows: bool) -> Dict[str, Any]:
     listed = (
         ctrl.list_windows(include_invisible=include_invisible, include_hidden=True)
@@ -285,6 +299,8 @@ def _op_window_list(ctrl: Any, include_invisible: bool, limit: int, only_windows
         data = element.to_dict()
         data["title"] = element.name
         data["foreground"] = bool(element.hwnd and element.hwnd == active_hwnd)
+        # P1（改动点 #11）：为每个窗口补 state，上层可直接按状态分派而无需再探测
+        data["state"] = _window_state_of(data.get("hwnd"))
         items.append(data)
 
     hidden = [item for item in items if not item.get("visible")]
@@ -304,12 +320,23 @@ def _op_window_list(ctrl: Any, include_invisible: bool, limit: int, only_windows
                 "window_count": 0,
                 "has_visible": False,
                 "hwnds": [],
+                "state": "unknown",
+                "states": {},
             },
         )
         entry["window_count"] += 1
         entry["has_visible"] = bool(entry["has_visible"] or item.get("visible"))
         if item.get("hwnd"):
             entry["hwnds"].append(item["hwnd"])
+        state = str(item.get("state") or "unknown")
+        entry["states"][state] = int(entry["states"].get(state, 0)) + 1
+
+    for entry in apps.values():
+        ranked = sorted(
+            entry["states"].keys(),
+            key=lambda name: _STATE_ORDER.index(name) if name in _STATE_ORDER else len(_STATE_ORDER),
+        )
+        entry["state"] = ranked[0] if ranked else "unknown"
 
     return {
         "ok": True,
@@ -347,6 +374,9 @@ def _op_window_list(ctrl: Any, include_invisible: bool, limit: int, only_windows
         "note": (
             "visible=false 的窗口未显示（最小化到托盘/隐藏），应用仍在运行；"
             "可直接用其 hwnd 调用 ui_activate_window 唤醒。"
+            "state ∈ {visible, minimized, hidden, cloaked, not_running} 为窗口状态"
+            "（cloaked=窗口被 DWM 隐藏，not_running=句柄已失效），apps[].state 取该应用各窗口的"
+            "最优状态，apps[].states 为状态分布。"
             "topmost=true 的窗口是置顶窗口，会盖住同区域普通窗口："
             "若目标窗口被其遮挡，坐标点击/键盘输入会落到置顶窗口上"
             "（ui_activate_window 返回的 covered / covered_by / hint 会给出提示）。"
@@ -361,7 +391,15 @@ def _op_activate_window(
     hwnd: Optional[int],
     exact: bool,
     restore: bool,
+    wait_ready: bool = True,
 ) -> Dict[str, Any]:
+    """置前窗口（写操作）。
+
+    P1（改动点 #9）：``wait_ready=True`` 时，唤醒（``SW_RESTORE`` / ``SW_SHOW``）后等待
+    ``bounds`` 稳定再置前，避免「刚显示完就点击」落到未完成布局的窗口上；返回体新增
+    ``state`` / ``stable`` / ``timing{show_ms, settle_ms, foreground_ms, total_ms}``。
+    ``wait_ready=False`` 时保持改造前语义（不等待）。
+    """
     if not title and not process_name and not hwnd:
         return {"ok": False, "error": "必须提供 hwnd / title / process_name 之一"}
     result = ctrl.activate_window(
@@ -370,6 +408,7 @@ def _op_activate_window(
         hwnd=int(hwnd) if hwnd else None,
         exact=exact,
         restore=restore,
+        wait_ready=bool(wait_ready),
     )
     result["ok"] = bool(result.get("activated"))
     if not result["ok"]:
@@ -540,6 +579,116 @@ def _op_click(
     else:
         payload["clicked"] = {"x": located.x, "y": located.y, "button": button, "clicks": int(clicks)}
     return payload
+
+
+def _op_app_ensure(
+    ctrl: Any,
+    app: Optional[str],
+    hwnd: Optional[int],
+    title: Optional[str],
+    process_name: Optional[str],
+    launch_if_missing: bool,
+    require_foreground: bool,
+    wait_ready: bool,
+    timeout: Optional[float],
+    launch_method: str = "auto",
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """统一唤起入口（P1 改动点 #10 + P2 改动点 #13/#15，写操作：可能启动进程、改变 Z 序）。
+
+    一次调用完成「状态判定（S1~S4）→ 启动（S4 且 ``launch_if_missing``）/ 唤醒 → 置前 →
+    就绪确认（bounds 稳定 + 可达校验）」，返回 ``state`` / ``hwnd`` / ``window`` /
+    ``timing`` / ``reachable`` / ``degraded_reason``。
+
+    - S4 未运行且 ``launch_if_missing=False``：保持 P1 行为，不启动进程，返回 ``candidates``；
+    - S4 未运行且 ``launch_if_missing=True``：dispatch 到 launcher（解析 → 启动 → 按 PID 等窗口就绪）；
+    - ``dry_run=True``：只解析启动入口，**不产生任何进程**（方案 3.1：写操作须支持 dry_run 预演）。
+    """
+    if not any([app, hwnd, title, process_name]):
+        return {"ok": False, "error": "必须提供 app / hwnd / title / process_name 之一"}
+    payload = ctrl.ensure_app(
+        app=app,
+        hwnd=int(hwnd) if hwnd else None,
+        title=title,
+        process_name=process_name,
+        launch_if_missing=bool(launch_if_missing),
+        require_foreground=bool(require_foreground),
+        wait_ready=bool(wait_ready),
+        timeout=float(timeout) if timeout else None,
+        launch_method=str(launch_method or "auto"),
+        dry_run=bool(dry_run),
+    )
+    if not payload.get("ok") and not payload.get("found"):
+        payload.setdefault(
+            "error",
+            payload.get("degraded_reason")
+            or payload.get("detail")
+            or "应用未运行且未授权启动（launch_if_missing=False）",
+        )
+    return payload
+
+
+def _op_launch_app(
+    ctrl: Any,
+    app: str,
+    dry_run: bool,
+    timeout: Optional[float],
+    launch_method: str,
+    args: str,
+    working_dir: str,
+    wait: bool,
+) -> Dict[str, Any]:
+    """启动应用并按 PID 等待窗口就绪（P2 改动点 #15，**写操作**：解析 → 启动 → 等就绪）。
+
+    权限与降级：``UIAGENT_LAUNCH_ENABLED=0`` → 直接拒绝（``degraded_reason="launch_disabled"``）；
+    ``UIAGENT_LAUNCH_ALLOWLIST`` 非空时严格校验（``not_allowlisted``）；解析多候选时不自动选择
+    （``ambiguous_candidates``）；等待超时返回 ``state="launching"`` 而非异常（方案 RF7）。
+    """
+    if not str(app or "").strip():
+        return {"ok": False, "error": "app 不能为空"}
+    return ctrl.launch_app(
+        str(app).strip(),
+        args=str(args or ""),
+        working_dir=str(working_dir or ""),
+        method=str(launch_method or "auto"),
+        dry_run=bool(dry_run),
+        timeout=float(timeout) if timeout else None,
+        wait=bool(wait),
+    )
+
+
+def _op_wait_window(
+    ctrl: Any,
+    pid: Optional[int],
+    hwnd: Optional[int],
+    app: Optional[str],
+    timeout: float,
+    stable_ms: float,
+) -> Dict[str, Any]:
+    """等待目标窗口出现并完成布局（P2 改动点 #15，**只读**）。
+
+    三选一定位：``hwnd`` > ``pid`` > ``app``。超时返回 ``ok=false`` / ``state="launching"``
+    （不是错误，供上层决定继续等待或放弃），替代上层「睡眠 + 反复查询」的轮询往返。
+    """
+    if not any([pid, hwnd, app]):
+        return {"ok": False, "error": "必须提供 pid / hwnd / app 之一"}
+    return ctrl.wait_app_window(
+        pid=int(pid or 0),
+        hwnd=int(hwnd or 0),
+        app=str(app or ""),
+        timeout=float(timeout),
+        stable_ms=float(stable_ms),
+    )
+
+
+
+def _op_app_status(
+    ctrl: Any,
+    apps: Optional[List[str]],
+    include_not_running: bool,
+) -> Dict[str, Any]:
+    """批量查询应用状态（P1 改动点 #10，**只读**：不改 Z 序、不启动进程）。"""
+    return ctrl.app_status(apps=apps or [], include_not_running=bool(include_not_running))
 
 
 def _op_type(ctrl: Any, text: str, interval: float, method: str) -> Dict[str, Any]:
@@ -717,6 +866,15 @@ async def ui_activate_window(
     ] = None,
     exact: Annotated[bool, Field(description="标题是否精确匹配，默认 false（子串）")] = False,
     restore: Annotated[bool, Field(description="窗口最小化时是否先还原，默认 true")] = True,
+    wait_ready: Annotated[
+        bool,
+        Field(
+            description=(
+                "唤醒（还原/显示）后是否等待窗口 bounds 稳定再置前，默认 true；"
+                "传 false 可跳过等待（提速约 150 ms，但刚唤醒的窗口可能尚未完成布局）"
+            )
+        ),
+    ] = True,
 ) -> str:
     """激活窗口（支持 hwnd，可唤醒隐藏窗口）。"""
     return await _guard(
@@ -726,6 +884,7 @@ async def ui_activate_window(
         hwnd,
         exact,
         restore,
+        wait_ready,
         tool="ui_activate_window",
         audit_args={
             "title": title,
@@ -733,7 +892,202 @@ async def ui_activate_window(
             "hwnd": hwnd,
             "exact": exact,
             "restore": restore,
+            "wait_ready": wait_ready,
         },
+    )
+
+
+@server.tool(
+    name="ui_app_ensure",
+    description=(
+        "把应用推进到可操作状态（写操作：可能启动进程、还原/显示窗口并改变 Z 序）。这是操作某个应用的"
+        "首选入口：一次调用完成「状态判定 → 启动/唤醒 → 置前 → 就绪确认」，取代"
+        "「ui_window_list 找 hwnd → ui_activate_window → 再定位」的多步往返。"
+        "传 app（应用别名/进程名，如 '微信' / 'weixin.exe' / '记事本'）或 hwnd（最稳）。"
+        "返回 state ∈ {visible, minimized, hidden, cloaked, not_running}（S1~S4 四状态分层）、"
+        "hwnd、window、timing{snapshot_ms, show_ms, settle_ms, foreground_ms, launch_ms, total_ms}、"
+        "reachable / covered_by。置前被系统拦截时返回 degraded=true 与"
+        "degraded_reason='foreground_locked'（不是失败）。"
+        "应用未启动时：launch_if_missing=true 会自动解析启动入口并启动（等同 ui_launch_app，"
+        "受 UIAGENT_LAUNCH_ENABLED / UIAGENT_LAUNCH_ALLOWLIST 约束）；默认 false 则只返回"
+        "state='not_running' 与 candidates，不启动任何进程。dry_run=true 可先预演启动解析。"
+    ),
+)
+async def ui_app_ensure(
+    app: Annotated[
+        Optional[str], Field(description="应用别名 / 进程名 / exe 名，如 '微信' / 'weixin.exe' / '记事本'")
+    ] = None,
+    hwnd: Annotated[
+        Optional[int], Field(description="窗口句柄（优先级最高，最稳；可用 ui_window_list 获取）", ge=1)
+    ] = None,
+    title: Annotated[Optional[str], Field(description="窗口标题（子串匹配，兼容既有定位方式）")] = None,
+    process_name: Annotated[Optional[str], Field(description="进程名片段，如 'weixin' / 'notepad.exe'")] = None,
+    launch_if_missing: Annotated[
+        bool,
+        Field(
+            description=(
+                "应用未运行时是否允许启动，默认 false（只返回状态与候选）；"
+                "true 时走 launcher 解析+启动+等窗口就绪（写操作，需 UIAGENT_LAUNCH_ENABLED 未关闭且通过白名单校验）"
+            )
+        ),
+    ] = False,
+    require_foreground: Annotated[
+        bool, Field(description="是否要求最终位于前台，默认 true；false 时仅唤醒不强制置前")
+    ] = True,
+    wait_ready: Annotated[
+        bool, Field(description="窗口从最小化/隐藏唤醒后是否等待 bounds 稳定（默认 true）")
+    ] = True,
+    timeout: Annotated[
+        Optional[float], Field(description="整体耗时预算（秒）；超预算则跳过就绪等待并降级返回", gt=0)
+    ] = None,
+    launch_method: Annotated[
+        str, Field(description="启动方式（仅 S4 启动时生效）：auto / exec（ShellExecuteEx）/ process（CreateProcess）/ uwp")
+    ] = "auto",
+    dry_run: Annotated[
+        bool, Field(description="预演：仅解析启动入口并返回，不启动任何进程（默认 false）")
+    ] = False,
+) -> str:
+    """统一应用唤起入口（四状态分层 + S4 启动）。"""
+    return await _guard(
+        _op_app_ensure,
+        app,
+        hwnd,
+        title,
+        process_name,
+        launch_if_missing,
+        require_foreground,
+        wait_ready,
+        timeout,
+        launch_method,
+        dry_run,
+        tool="ui_app_ensure",
+        audit_args={
+            "app": app,
+            "hwnd": hwnd,
+            "title": title,
+            "process_name": process_name,
+            "launch_if_missing": launch_if_missing,
+            "require_foreground": require_foreground,
+            "wait_ready": wait_ready,
+            "timeout": timeout,
+            "launch_method": launch_method,
+            "dry_run": dry_run,
+        },
+    )
+
+
+@server.tool(
+    name="ui_app_status",
+    description=(
+        "批量查询应用状态（只读：不改 Z 序、不启动进程、不唤醒窗口）。用于动作前做一次"
+        "廉价决策：apps 为空时返回当前所有「像应用主窗口」的聚合，传 apps（如 ['微信','记事本']）"
+        "则逐个查询（未启动的应用会返回 state='not_running'）。"
+        "每项包含 state ∈ {visible, minimized, hidden, cloaked, not_running}、hwnd、window、"
+        "foreground、cached、multi_instance、candidates。"
+    ),
+)
+async def ui_app_status(
+    apps: Annotated[
+        Optional[List[str]], Field(description="待查询应用列表（别名/进程名），留空则返回全部应用窗口聚合")
+    ] = None,
+    include_not_running: Annotated[
+        bool, Field(description="是否返回未启动应用的记录（state='not_running'），默认 true")
+    ] = True,
+) -> str:
+    """批量查询应用状态（只读）。"""
+    return await _guard(
+        _op_app_status,
+        apps,
+        include_not_running,
+        tool="ui_app_status",
+        audit_args={"apps": apps, "include_not_running": include_not_running},
+    )
+
+
+@server.tool(
+    name="ui_launch_app",
+    description=(
+        "启动应用并等待窗口就绪（写操作：会创建新进程，属高风险能力）。用于「应用当前未运行」"
+        "场景，替代人工模拟「Win 键 + 搜索 + 回车」。解析顺序：内置别名表 → 注册表 App Paths → "
+        "开始菜单 .lnk → UWP；多候选时**不自动选择**，返回 candidates 与 resolved_by 由上层决策。"
+        "返回 state ∈ {launching, visible, minimized, hidden, not_running}、hwnd、pid、"
+        "resolved_by、target_path、launch_ms、wait_ms。"
+        "dry_run=true 只解析不启动（返回 resolved_by / target_path，不产生任何进程）。"
+        "安全约束：UIAGENT_LAUNCH_ENABLED=0 时直接拒绝（degraded_reason='launch_disabled'）；"
+        "UIAGENT_LAUNCH_ALLOWLIST 非空时严格校验（'not_allowlisted'）；等待窗口超时返回 "
+        "state='launching'（不是错误）。"
+    ),
+)
+async def ui_launch_app(
+    app: Annotated[
+        str, Field(description="应用别名 / exe 名 / 完整路径，如 '记事本' / 'notepad.exe' / 'C:/Windows/System32/calc.exe'")
+    ],
+    dry_run: Annotated[
+        bool, Field(description="预演：只解析启动入口并返回，不启动任何进程（默认 false）")
+    ] = False,
+    timeout: Annotated[
+        Optional[float], Field(description="启动后等待窗口就绪的超时（秒）；留空按分级默认（轻量 1.5~20 s）", gt=0)
+    ] = None,
+    launch_method: Annotated[
+        str, Field(description="启动方式：auto / exec（ShellExecuteEx）/ process（CreateProcess）/ uwp")
+    ] = "auto",
+    args: Annotated[str, Field(description="附加命令行参数（默认空；仅在被启动应用确需时使用）")] = "",
+    working_dir: Annotated[str, Field(description="工作目录（默认空，即不指定）")] = "",
+    wait: Annotated[
+        bool, Field(description="是否等待窗口就绪（默认 true）；false 只发起启动立即返回 pid")
+    ] = True,
+) -> str:
+    """启动应用并等待窗口就绪（写操作）。"""
+    return await _guard(
+        _op_launch_app,
+        app,
+        dry_run,
+        timeout,
+        launch_method,
+        args,
+        working_dir,
+        wait,
+        tool="ui_launch_app",
+        audit_args={
+            "app": app,
+            "dry_run": dry_run,
+            "timeout": timeout,
+            "launch_method": launch_method,
+            "args": args,
+            "working_dir": working_dir,
+            "wait": wait,
+        },
+    )
+
+
+@server.tool(
+    name="ui_wait_window",
+    description=(
+        "等待目标窗口出现并完成布局（只读：不启动进程、不改 Z 序）。替代上层「睡眠 + 反复查询」"
+        "的轮询往返。三选一定位：hwnd > pid > app（app 走别名/进程名匹配）。"
+        "返回 ok / state（ready 视为就绪；超时返回 state='launching'，不是错误）/ hwnd / window / "
+        "waited_ms / stable。适用：启动较慢的应用（浏览器/Office/IDE）或刚发起的启动操作后确认窗口可用。"
+    ),
+)
+async def ui_wait_window(
+    pid: Annotated[Optional[int], Field(description="目标进程 ID（启动后由 ui_launch_app 返回）", ge=1)] = None,
+    hwnd: Annotated[Optional[int], Field(description="目标窗口句柄（优先级最高）", ge=1)] = None,
+    app: Annotated[Optional[str], Field(description="应用别名 / 进程名，如 '记事本' / 'notepad.exe'")] = None,
+    timeout: Annotated[float, Field(description="最长等待时间（秒），默认 10", gt=0)] = 10.0,
+    stable_ms: Annotated[
+        float, Field(description="窗口 bounds 需保持稳定的时长（毫秒），默认 150", ge=0)
+    ] = 150.0,
+) -> str:
+    """等待窗口出现并完成布局（只读）。"""
+    return await _guard(
+        _op_wait_window,
+        pid,
+        hwnd,
+        app,
+        timeout,
+        stable_ms,
+        tool="ui_wait_window",
+        audit_args={"pid": pid, "hwnd": hwnd, "app": app, "timeout": timeout, "stable_ms": stable_ms},
     )
 
 

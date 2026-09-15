@@ -1,0 +1,895 @@
+"""ui-agent MCP Server（stdio 传输）。
+
+把 UIA + OCR 操控内核包装为本地 MCP Server，供 CowAgent / Marvis 等 MCP 客户端
+通过 stdio（JSON-RPC over stdin/stdout）调用。暴露 8 个工具：
+
+===========================  ============================================
+工具                          作用
+===========================  ============================================
+``ui_window_list``           枚举顶层窗口（含隐藏/托盘窗口，带可见性与应用标识）
+``ui_activate_window``       按 hwnd/标题/进程名把窗口置为前台（可唤醒隐藏窗口）
+``ui_find``                  定位元素/界面文字（UIA 优先，OCR 兜底）
+``ui_click``                 点击目标（定位式或坐标式）
+``ui_type``                  输入文本（中文自动走剪贴板）
+``ui_hotkey``                发送快捷键
+``ui_screenshot``            截屏保存到文件
+``ui_ocr``                   屏幕 OCR（文本块 / 关键词命中 / 整屏文本）
+===========================  ============================================
+
+设计要点
+--------
+1. **stdout 只承载 JSON-RPC**：内核日志固定走 stderr（见 ``logging_utils``），
+   避免污染协议通道。
+2. **COM 单线程**：UI Automation 依赖 COM，且 ``uiautomation`` 不保证跨线程安全。
+   所有工具调用都被派发到**同一个**已完成 ``CoInitializeEx(APARTMENTTHREADED)``
+   的工作线程串行执行（``_UiThread``），工具函数因此声明为 ``async def``。
+3. **DPI 感知**：进程启动后第一件事就是 ``SetProcessDpiAwareness(2)``，保证
+   UIA 边界矩形 / 截图像素 / 鼠标坐标处于同一物理像素坐标系。
+4. **返回值**：统一为 JSON 字符串（``ensure_ascii=False``），恒含 ``ok`` 字段。
+
+用法::
+
+    .venv\\Scripts\\python.exe serve_mcp.py          # 直接启动 stdio 服务
+    .venv\\Scripts\\python.exe main.py mcp           # 通过 CLI 启动
+"""
+
+from __future__ import annotations
+
+import asyncio
+import ctypes
+import json
+import os
+import queue
+import re
+import sys
+import tempfile
+import threading
+import time
+from typing import Annotated, Any, Callable, Dict, List, Optional
+
+from mcp.server.mcpserver import MCPServer
+from pydantic import Field
+
+SERVER_NAME = "ui-agent"
+SERVER_VERSION = "0.2.0"
+
+_COINIT_APARTMENTTHREADED = 0x2
+
+#: 禁止写入的系统核心目录（截图等落盘操作的前置安检）
+_FORBIDDEN_WRITE_ROOTS = (
+    "c:\\windows",
+    "c:\\program files",
+    "c:\\program files (x86)",
+    "c:\\programdata",
+)
+
+_KEY_ALIASES = {
+    "control": "ctrl",
+    "ctl": "ctrl",
+    "windows": "win",
+    "cmd": "win",
+    "meta": "win",
+    "escape": "esc",
+    "return": "enter",
+    "del": "delete",
+    "spacebar": "space",
+    "pgup": "pageup",
+    "pgdn": "pagedown",
+}
+
+
+# ===================================================================== 基础工具
+def _json(payload: Any) -> str:
+    """序列化为 MCP 文本内容（保持中文可读）。"""
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _force_utf8_stdio() -> None:
+    """把 stdio 固定为 UTF-8，避免中文在 GBK 代码页下抛 UnicodeEncodeError。"""
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # pragma: no cover - 流被重定向 / 非标准流
+            pass
+
+
+def _default_output_dir() -> str:
+    """截图默认输出目录：``UI_AGENT_OUTPUT_DIR`` 或系统临时目录。"""
+    override = os.environ.get("UI_AGENT_OUTPUT_DIR")
+    if override:
+        return os.path.abspath(override)
+    return os.path.join(tempfile.gettempdir(), "ui-agent", "shots")
+
+
+def _ensure_writable(path: str) -> str:
+    """校验并准备输出路径（拒绝写入系统核心目录）。"""
+    target = os.path.abspath(path)
+    lowered = target.lower()
+    for root in _FORBIDDEN_WRITE_ROOTS:
+        if lowered == root or lowered.startswith(root + os.sep):
+            raise PermissionError(f"拒绝写入系统核心目录：{target}")
+    directory = os.path.dirname(target)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    return target
+
+
+def _parse_region(region: Any) -> Optional[tuple]:
+    """把 ``[left, top, width, height]`` / ``"l,t,w,h"`` 解析为元组。"""
+    if region is None:
+        return None
+    if isinstance(region, str):
+        parts = [p for p in re.split(r"[,\s]+", region.strip()) if p]
+        values = [int(float(p)) for p in parts]
+    else:
+        values = [int(float(v)) for v in region]
+    if len(values) != 4:
+        raise ValueError(f"region 必须是 (left, top, width, height) 四元组，收到 {region!r}")
+    if values[2] <= 0 or values[3] <= 0:
+        raise ValueError(f"region 宽高必须为正数，收到 {region!r}")
+    return tuple(values)
+
+
+def _parse_hotkey(keys: Any) -> List[str]:
+    """把 ``"ctrl+shift+s"`` / ``["ctrl", "s"]`` 解析为按键列表。"""
+    if isinstance(keys, str):
+        raw = [k.strip() for k in re.split(r"[+,]", keys) if k.strip()]
+    else:
+        raw = [str(k).strip() for k in (keys or []) if str(k).strip()]
+    return [_KEY_ALIASES.get(k.lower(), k.lower()) for k in raw]
+
+
+def _element_payload(element: Any, with_native_hwnd: bool = False) -> Dict[str, Any]:
+    """UIElement → dict；可选附带 HWND。"""
+    data = element.to_dict()
+    if with_native_hwnd:
+        data["hwnd"] = int(getattr(element.native, "NativeWindowHandle", 0) or 0)
+    return data
+
+
+# ===================================================================== COM 工作线程
+class _UiThread:
+    """专用 COM 工作线程：所有内核调用在此串行执行。
+
+    线程与进程同生命周期（daemon 线程 + 阻塞队列），保证：
+
+    * COM 单线程套间（STA）只初始化一次，``uiautomation`` 缓存的元素引用始终有效；
+    * 所有 GUI 调用天然串行，不出现并发争抢焦点；
+    * 不依赖线程池，避免「线程池提交嵌套线程池」的自锁。
+    """
+
+    def __init__(self) -> None:
+        self._queue: "queue.Queue" = queue.Queue()
+        self._controller: Any = None
+        self._thread = threading.Thread(target=self._main, name="ui-agent-com", daemon=True)
+        self._thread.start()
+
+    # ------------------------------------------------------------ 专用线程主体
+    def _main(self) -> None:
+        # 1) COM 单线程套间（uiautomation / comtypes 的前置条件）
+        try:
+            ctypes.windll.ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
+        except Exception:  # pragma: no cover - 已初始化或非 Windows
+            pass
+        # 2) 统一坐标系（幂等；进程级设置，主线程通常已先行设置）
+        try:
+            from .dpi import enable_dpi_awareness
+
+            enable_dpi_awareness()
+        except Exception:  # pragma: no cover
+            pass
+
+        while True:
+            item = self._queue.get()
+            if item is None:  # 退出哨兵
+                return
+            func, box = item
+            try:
+                box["result"] = func()
+            except BaseException as exc:  # noqa: BLE001 - 原样回抛给调用方
+                box["error"] = exc
+            finally:
+                box["done"].set()
+
+    # ------------------------------------------------------------ 内核控制器
+    def ensure_controller(self) -> Any:
+        """仅在 COM 工作线程内被调用；惰性构造内核控制器。"""
+        if self._controller is None:
+            # 惰性导入，确保 DPI 感知早于 PIL / uiautomation 导入
+            from .controller import UniversalController
+
+            timeout = float(os.environ.get("UI_AGENT_SEARCH_TIMEOUT", "2.0"))
+            self._controller = UniversalController(search_timeout=timeout)
+            self._controller.environment()  # 首次触达 UIA，尽早暴露环境问题
+        return self._controller
+
+    # ------------------------------------------------------------ 调用入口
+    def run(self, func: Callable[[Any], Any], timeout: Optional[float] = None) -> Any:
+        """把 ``func(controller)`` 投递到 COM 线程执行并等待结果。"""
+        if timeout is None:
+            timeout = float(os.environ.get("UI_AGENT_CALL_TIMEOUT", "120"))
+        box: Dict[str, Any] = {"done": threading.Event()}
+        self._queue.put((lambda: func(self.ensure_controller()), box))
+        if not box["done"].wait(timeout):
+            raise TimeoutError(f"ui-agent 内核调用超时（>{timeout}s），目标窗口可能无响应")
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+
+_UI = _UiThread()
+
+
+async def _call(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """把内核调用派发到 COM 单线程，阻塞等待结果（不阻塞事件循环）。"""
+    return await asyncio.to_thread(_UI.run, lambda controller: fn(controller, *args, **kwargs))
+
+
+async def _guard(
+    fn: Any,
+    *args: Any,
+    tool: str = "",
+    audit_args: Optional[Dict[str, Any]] = None,
+    **kwargs: Any,
+) -> str:
+    """统一异常边界：内核异常转为 ``{"ok": false, "error": ...}``。
+
+    同时作为审计出口：调用前落 ``tool_call``，返回前落 ``tool_result``
+    （含耗时与成败）。``audit_args`` 只做入参摘要，``text`` 字段按脱敏策略处理。
+    """
+    from .audit import get_audit_logger, mask_args
+
+    audit = get_audit_logger()
+    started = time.time()
+    if audit is not None:
+        audit.log(
+            "tool_call",
+            tool=tool,
+            args=mask_args(audit_args, audit.text_policy),
+        )
+
+    ok = True
+    error = ""
+    try:
+        payload = await _call(fn, *args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - 契约要求任何失败都以 JSON 返回
+        ok = False
+        error = f"{type(exc).__name__}: {exc}"
+        payload = {"ok": False, "error": error}
+
+    text = _json(payload)
+    if audit is not None:
+        audit.log(
+            "tool_result",
+            tool=tool,
+            ok=ok,
+            duration_ms=round((time.time() - started) * 1000.0, 3),
+            result_size=len(text),
+            error=error,
+        )
+    return text
+
+
+# ===================================================================== 内核操作实现
+def _op_window_list(ctrl: Any, include_invisible: bool, limit: int, only_windows: bool) -> Dict[str, Any]:
+    listed = (
+        ctrl.list_windows(include_invisible=include_invisible, include_hidden=True)
+        if only_windows
+        else ctrl.list_top_level(include_invisible=include_invisible, include_hidden=True)
+    )
+    active = ctrl.get_active_window()
+    active_hwnd = int(getattr(active, "hwnd", 0) or 0) if active is not None else 0
+
+    items: List[Dict[str, Any]] = []
+    for element in listed[: max(1, int(limit))]:
+        data = element.to_dict()
+        data["title"] = element.name
+        data["foreground"] = bool(element.hwnd and element.hwnd == active_hwnd)
+        items.append(data)
+
+    hidden = [item for item in items if not item.get("visible")]
+    topmost_windows = [item for item in items if item.get("topmost")]
+    apps: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        key = item.get("app_alias") or item.get("process_name") or str(item.get("process_id"))
+        entry = apps.setdefault(
+            key,
+            {
+                "app_alias": item.get("app_alias", ""),
+                "app_id": item.get("app_id", ""),
+                "process_id": item.get("process_id", 0),
+                "process_name": item.get("process_name", ""),
+                "process_path": item.get("process_path", ""),
+                "framework": item.get("framework", ""),
+                "window_count": 0,
+                "has_visible": False,
+                "hwnds": [],
+            },
+        )
+        entry["window_count"] += 1
+        entry["has_visible"] = bool(entry["has_visible"] or item.get("visible"))
+        if item.get("hwnd"):
+            entry["hwnds"].append(item["hwnd"])
+
+    return {
+        "ok": True,
+        "count": len(items),
+        "total": len(listed),
+        "visible_count": len(items) - len(hidden),
+        "hidden_count": len(hidden),
+        "foreground_window": active.to_dict() if active is not None else None,
+        "environment": ctrl.environment(),
+        "apps": list(apps.values()),
+        "hidden_windows": [
+            {
+                "hwnd": item.get("hwnd"),
+                "title": item.get("title"),
+                "app_alias": item.get("app_alias"),
+                "process_name": item.get("process_name"),
+                "class_name": item.get("class_name"),
+                "iconic": item.get("iconic"),
+            }
+            for item in hidden
+        ],
+        "topmost_count": len(topmost_windows),
+        "topmost_windows": [
+            {
+                "hwnd": item.get("hwnd"),
+                "title": item.get("title"),
+                "app_alias": item.get("app_alias"),
+                "process_name": item.get("process_name"),
+                "class_name": item.get("class_name"),
+                "bounds": item.get("bounds"),
+            }
+            for item in topmost_windows
+        ],
+        "windows": items,
+        "note": (
+            "visible=false 的窗口未显示（最小化到托盘/隐藏），应用仍在运行；"
+            "可直接用其 hwnd 调用 ui_activate_window 唤醒。"
+            "topmost=true 的窗口是置顶窗口，会盖住同区域普通窗口："
+            "若目标窗口被其遮挡，坐标点击/键盘输入会落到置顶窗口上"
+            "（ui_activate_window 返回的 covered / covered_by / hint 会给出提示）。"
+        ),
+    }
+
+
+def _op_activate_window(
+    ctrl: Any,
+    title: Optional[str],
+    process_name: Optional[str],
+    hwnd: Optional[int],
+    exact: bool,
+    restore: bool,
+) -> Dict[str, Any]:
+    if not title and not process_name and not hwnd:
+        return {"ok": False, "error": "必须提供 hwnd / title / process_name 之一"}
+    result = ctrl.activate_window(
+        title=title,
+        process_name=process_name,
+        hwnd=int(hwnd) if hwnd else None,
+        exact=exact,
+        restore=restore,
+    )
+    result["ok"] = bool(result.get("activated"))
+    if not result["ok"]:
+        if result.get("found"):
+            result["error"] = result.get("detail", "窗口置前未生效")
+        else:
+            result["error"] = result.get("detail", "未找到匹配窗口")
+            result["error"] += "；详见 hints（可执行的排查建议）与 candidates（疑似候选窗口）"
+    return result
+
+
+def _op_find(
+    ctrl: Any,
+    target: str,
+    role: Optional[str],
+    window_title: Optional[str],
+    use_ocr_fallback: bool,
+    fuzzy: bool,
+    limit: int,
+) -> Dict[str, Any]:
+    window = None
+    region = None
+    if window_title:
+        window = ctrl.find_window(title=window_title)
+        if window is None:
+            return {"ok": False, "found": False, "error": f"未找到窗口 {window_title!r}"}
+        if window.is_clickable:
+            region = tuple(window.bounds)
+
+    located = ctrl.locate(
+        target,
+        use_ocr_fallback=use_ocr_fallback,
+        window=window,
+        role=role,
+        fuzzy=fuzzy,
+        region=region,
+    )
+    payload = located.to_dict()
+    payload["ok"] = bool(located.found)
+
+    if limit and int(limit) > 1:
+        matches = ctrl.locate_many(target, role=role, window=window, limit=int(limit))
+        payload["matches"] = [m.to_dict(with_element=False) for m in matches]
+        payload["match_count"] = len(matches)
+    return payload
+
+
+def _op_click(
+    ctrl: Any,
+    target: Optional[str],
+    x: Optional[int],
+    y: Optional[int],
+    button: str,
+    clicks: int,
+    verify: bool,
+    use_ocr_fallback: bool,
+) -> Dict[str, Any]:
+    if target is None and (x is None or y is None):
+        return {"ok": False, "error": "必须提供 target，或同时提供 x / y 坐标"}
+    located = ctrl.click(
+        target=target,
+        x=x,
+        y=y,
+        button=button,
+        clicks=int(clicks),
+        use_ocr_fallback=use_ocr_fallback,
+        verify=verify,
+    )
+    payload = located.to_dict()
+    payload["ok"] = bool(located.found)
+    if not located.found:
+        payload["error"] = "目标未找到，未执行点击"
+    else:
+        payload["clicked"] = {"x": located.x, "y": located.y, "button": button, "clicks": int(clicks)}
+    return payload
+
+
+def _op_type(ctrl: Any, text: str, interval: float, method: str) -> Dict[str, Any]:
+    if text is None or text == "":
+        return {"ok": False, "error": "text 不能为空"}
+    started = time.perf_counter()
+    mode = (method or "auto").lower()
+    if mode == "clipboard":
+        ctrl.type_chinese(text)
+    elif mode in ("auto", "keystroke"):
+        ctrl.type_text(text, interval=float(interval))
+    else:
+        return {"ok": False, "error": f"method 仅支持 auto / keystroke / clipboard，收到 {method!r}"}
+    return {
+        "ok": True,
+        "chars": len(text),
+        "method": mode,
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+    }
+
+
+def _op_hotkey(ctrl: Any, keys: Any, delay: float) -> Dict[str, Any]:
+    combo = _parse_hotkey(keys)
+    if not combo:
+        return {"ok": False, "error": "keys 不能为空，例如 'ctrl+s'"}
+    if delay and float(delay) > 0:
+        time.sleep(float(delay))
+    ctrl.hotkey(*combo)
+    return {"ok": True, "keys": combo, "sent_at": time.time()}
+
+
+def _op_screenshot(ctrl: Any, path: Optional[str], region: Any) -> Dict[str, Any]:
+    rect = _parse_region(region)
+    if path:
+        target = _ensure_writable(path)
+        ext = os.path.splitext(target)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
+            raise ValueError(f"不支持的图片扩展名：{ext or '(空)'}")
+    else:
+        target = os.path.join(
+            _default_output_dir(), f"ui_screenshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        )
+        target = _ensure_writable(target)
+
+    image = ctrl.screenshot(rect)
+    image.save(target)
+    return {
+        "ok": True,
+        "path": target,
+        "width": int(image.size[0]),
+        "height": int(image.size[1]),
+        "region": list(rect) if rect else None,
+    }
+
+
+def _op_ocr(
+    ctrl: Any,
+    region: Any,
+    keyword: Optional[str],
+    mode: str,
+    limit: int,
+    fuzzy: bool,
+) -> Dict[str, Any]:
+    rect = _parse_region(region)
+    mode = (mode or "blocks").lower()
+
+    if mode == "text":
+        text = ctrl.ocr_text(rect)
+        clipped = text[: int(limit)] if limit and int(limit) > 0 else text
+        return {
+            "ok": True,
+            "mode": "text",
+            "text": clipped,
+            "length": len(text),
+            "truncated": len(clipped) < len(text),
+            "region": list(rect) if rect else None,
+        }
+
+    if mode == "keyword" or keyword:
+        if not keyword:
+            return {"ok": False, "error": "mode=keyword 时必须提供 keyword"}
+        hits = ctrl.find_text_on_screen(keyword, fuzzy=fuzzy, region=rect)
+        matched = hits[: int(limit)] if limit and int(limit) > 0 else hits
+        return {
+            "ok": True,
+            "mode": "keyword",
+            "keyword": keyword,
+            "count": len(hits),
+            "matches": [h.to_dict() for h in matched],
+        }
+
+    if mode != "blocks":
+        return {"ok": False, "error": f"mode 仅支持 blocks / keyword / text，收到 {mode!r}"}
+
+    blocks = ctrl.ocr_screen(rect)
+    shown = blocks[: int(limit)] if limit and int(limit) > 0 else blocks
+    return {
+        "ok": True,
+        "mode": "blocks",
+        "count": len(blocks),
+        "blocks": [b.to_dict() for b in shown],
+        "region": list(rect) if rect else None,
+    }
+
+
+# ===================================================================== MCP Server
+server = MCPServer(
+    name=SERVER_NAME,
+    title="ui-agent (Windows UIA + OCR)",
+    version=SERVER_VERSION,
+    instructions=(
+        "Windows 桌面自动化内核：UI Automation 优先、OCR 兜底，坐标为屏幕绝对物理像素。"
+        "ui_click / ui_type / ui_hotkey / ui_activate_window 会真实操控桌面，调用前请确认目标。"
+    ),
+)
+
+
+@server.tool(
+    name="ui_window_list",
+    description=(
+        "枚举当前桌面的顶层窗口（只读）。返回窗口标题、类名、边界矩形、中心点、进程、"
+        "hwnd 句柄、是否前台、是否可见（visible）以及应用别名（app_alias，如「微信」）等；"
+        "同时返回 hidden_windows（应用在运行但窗口未显示的隐藏/托盘窗口）、apps（按应用聚合）"
+        "与 DPI / 屏幕环境快照。默认包含隐藏窗口：若窗口标题是登录昵称（如微信的 Hugo_ever），"
+        "可通过 app_alias / process_name 对应到具体应用，并用 hwnd 精确激活。"
+    ),
+)
+async def ui_window_list(
+    include_invisible: Annotated[
+        bool,
+        Field(
+            description=(
+                "是否连同辅助/工具/消息类不可见窗口一起返回（默认 false）。"
+                "注意：隐藏或最小化到托盘的应用主窗口始终会返回，并带 visible=false 标识"
+            )
+        ),
+    ] = False,
+    only_windows: Annotated[
+        bool, Field(description="仅返回窗口角色的顶层控件（默认 true）；false 时含任务栏等全部顶层控件")
+    ] = True,
+    limit: Annotated[int, Field(description="返回窗口数量上限（1-300）", ge=1, le=300)] = 50,
+) -> str:
+    """枚举顶层窗口（含隐藏 / 托盘窗口）。"""
+    return await _guard(
+        _op_window_list,
+        include_invisible,
+        limit,
+        only_windows,
+        tool="ui_window_list",
+        audit_args={
+            "include_invisible": include_invisible,
+            "only_windows": only_windows,
+            "limit": limit,
+        },
+    )
+
+
+@server.tool(
+    name="ui_activate_window",
+    description=(
+        "把窗口置为前台（写操作：改变 Z 序，隐藏/最小化时先唤醒显示）。三种定位方式："
+        "hwnd（最稳，推荐；可直接用 ui_window_list 返回的 hwnd）、title（默认子串匹配）、"
+        "process_name（如 'weixin.exe' / 'notepad.exe'）。注意微信/QQ 等窗口标题常为登录昵称，"
+        "此时用 hwnd 或 process_name 定位。未命中时返回 hints（可执行的排查建议）与"
+        "candidates（疑似候选窗口）供下一步使用。"
+    ),
+)
+async def ui_activate_window(
+    title: Annotated[Optional[str], Field(description="窗口标题（默认子串匹配；也可传应用别名如 '微信'）")] = None,
+    process_name: Annotated[
+        Optional[str], Field(description="进程名或可执行路径片段，如 'notepad.exe' / 'weixin'")
+    ] = None,
+    hwnd: Annotated[
+        Optional[int], Field(description="窗口句柄（优先级最高，可激活隐藏/托盘窗口，不含 0）", ge=1)
+    ] = None,
+    exact: Annotated[bool, Field(description="标题是否精确匹配，默认 false（子串）")] = False,
+    restore: Annotated[bool, Field(description="窗口最小化时是否先还原，默认 true")] = True,
+) -> str:
+    """激活窗口（支持 hwnd，可唤醒隐藏窗口）。"""
+    return await _guard(
+        _op_activate_window,
+        title,
+        process_name,
+        hwnd,
+        exact,
+        restore,
+        tool="ui_activate_window",
+        audit_args={
+            "title": title,
+            "process_name": process_name,
+            "hwnd": hwnd,
+            "exact": exact,
+            "restore": restore,
+        },
+    )
+
+
+@server.tool(
+    name="ui_find",
+    description=(
+        "定位界面目标并返回屏幕坐标（只读，不点击）。先用 UI Automation 按名称/角色查找，"
+        "未命中时可回退到 OCR 文字定位。可传 window_title 把搜索范围限制在某个窗口内。"
+    ),
+)
+async def ui_find(
+    target: Annotated[str, Field(description="元素名称或界面文字，如 '保存' / '文本编辑器'")],
+    role: Annotated[
+        Optional[str], Field(description="限定元素角色，如 'Button' / 'Edit' / 'Window'")
+    ] = None,
+    window_title: Annotated[
+        Optional[str], Field(description="限定搜索窗口标题（子串匹配），缺省搜索整个桌面")
+    ] = None,
+    use_ocr_fallback: Annotated[
+        bool, Field(description="UIA 未命中时是否启用 OCR 兜底，默认 true")
+    ] = True,
+    fuzzy: Annotated[bool, Field(description="OCR 文字是否模糊匹配，默认 true")] = True,
+    limit: Annotated[
+        int, Field(description="返回的候选命中数量上限（1-50），>1 时附带 matches 列表", ge=1, le=50)
+    ] = 1,
+) -> str:
+    """定位元素 / 界面文字。"""
+    return await _guard(
+        _op_find,
+        target,
+        role,
+        window_title,
+        use_ocr_fallback,
+        fuzzy,
+        limit,
+        tool="ui_find",
+        audit_args={
+            "target": target,
+            "role": role,
+            "window_title": window_title,
+            "use_ocr_fallback": use_ocr_fallback,
+            "fuzzy": fuzzy,
+            "limit": limit,
+        },
+    )
+
+
+@server.tool(
+    name="ui_click",
+    description=(
+        "点击目标（写操作）。可传 target 走「UIA → OCR」定位后点击，也可直接传坐标 x/y。"
+        "返回实际点击坐标与定位来源（uia / ocr / coords）。"
+    ),
+)
+async def ui_click(
+    target: Annotated[
+        Optional[str], Field(description="要点击的元素名称或界面文字；与 x/y 二选一")
+    ] = None,
+    x: Annotated[Optional[int], Field(description="屏幕绝对 X 坐标（物理像素）")] = None,
+    y: Annotated[Optional[int], Field(description="屏幕绝对 Y 坐标（物理像素）")] = None,
+    button: Annotated[
+        str, Field(description="鼠标按键：left / right / middle", pattern="^(left|right|middle)$")
+    ] = "left",
+    clicks: Annotated[int, Field(description="点击次数（1=单击，2=双击）", ge=1, le=3)] = 1,
+    verify: Annotated[bool, Field(description="点击后回读该坐标点元素信息，默认 false")] = False,
+    use_ocr_fallback: Annotated[
+        bool, Field(description="target 定位失败时是否用 OCR 兜底，默认 true")
+    ] = True,
+) -> str:
+    """点击目标。"""
+    return await _guard(
+        _op_click,
+        target,
+        x,
+        y,
+        button,
+        clicks,
+        verify,
+        use_ocr_fallback,
+        tool="ui_click",
+        audit_args={
+            "target": target,
+            "x": x,
+            "y": y,
+            "button": button,
+            "clicks": clicks,
+            "verify": verify,
+            "use_ocr_fallback": use_ocr_fallback,
+        },
+    )
+
+
+@server.tool(
+    name="ui_type",
+    description=(
+        "向当前焦点处输入文本（写操作）。纯 ASCII 走键盘逐字符输入，含中文时自动改用剪贴板粘贴，"
+        "调用前请确保目标输入框已获得焦点（可先用 ui_click 点击）。"
+    ),
+)
+async def ui_type(
+    text: Annotated[str, Field(description="要输入的文本（支持中文与换行）")],
+    interval: Annotated[
+        float, Field(description="逐字符间隔秒数（仅键盘输入模式生效）", ge=0.0, le=1.0)
+    ] = 0.02,
+    method: Annotated[
+        str,
+        Field(
+            description="输入方式：auto（默认，含中文自动走剪贴板）/ keystroke（强制逐字符键盘输入）/ clipboard（强制剪贴板粘贴）",
+            pattern="^(auto|keystroke|clipboard)$",
+        ),
+    ] = "auto",
+) -> str:
+    """输入文本。"""
+    return await _guard(
+        _op_type,
+        text,
+        interval,
+        method,
+        tool="ui_type",
+        audit_args={"text": text, "interval": interval, "method": method},
+    )
+
+
+@server.tool(
+    name="ui_hotkey",
+    description=(
+        "发送组合快捷键（写操作），如 'ctrl+s'、'alt+f4'、'ctrl+shift+esc'。"
+        "按键名不区分大小写，支持 ctrl / alt / shift / win / esc / enter / tab / f1-f12 / a-z / 0-9 等。"
+    ),
+)
+async def ui_hotkey(
+    keys: Annotated[str, Field(description="快捷键字符串，多个键用 + 分隔，如 'ctrl+shift+s'")],
+    delay: Annotated[float, Field(description="发送前等待秒数，默认 0", ge=0.0, le=5.0)] = 0.0,
+) -> str:
+    """发送快捷键。"""
+    return await _guard(
+        _op_hotkey,
+        keys,
+        delay,
+        tool="ui_hotkey",
+        audit_args={"keys": keys, "delay": delay},
+    )
+
+
+@server.tool(
+    name="ui_screenshot",
+    description=(
+        "截屏并保存为图片文件（只读，不改变桌面）。region 缺省截取整个虚拟桌面，"
+        "传 [left, top, width, height] 可截取指定区域；path 缺省写入临时目录。"
+    ),
+)
+async def ui_screenshot(
+    path: Annotated[
+        Optional[str], Field(description="保存的绝对路径（.png/.jpg/.bmp/.webp），缺省为临时目录下的时间戳文件名")
+    ] = None,
+    region: Annotated[
+        Optional[List[int]],
+        Field(description="截图区域 [left, top, width, height]（屏幕绝对物理像素），缺省全屏"),
+    ] = None,
+) -> str:
+    """截屏保存。"""
+    return await _guard(
+        _op_screenshot,
+        path,
+        region,
+        tool="ui_screenshot",
+        audit_args={"path": path, "region": region},
+    )
+
+
+@server.tool(
+    name="ui_ocr",
+    description=(
+        "对屏幕（或指定区域）做 OCR（只读）。mode=blocks 返回全部文本块及坐标；"
+        "mode=keyword 按关键词定位文字并返回命中坐标；mode=text 返回整屏拼接文本。"
+    ),
+)
+async def ui_ocr(
+    region: Annotated[
+        Optional[List[int]],
+        Field(description="识别区域 [left, top, width, height]，缺省全屏"),
+    ] = None,
+    keyword: Annotated[
+        Optional[str], Field(description="要查找的文字（传入即按关键词模式返回命中坐标）")
+    ] = None,
+    mode: Annotated[
+        str,
+        Field(
+            description="返回模式：blocks（文本块）/ keyword（关键词命中）/ text（整屏文本）",
+            pattern="^(blocks|keyword|text)$",
+        ),
+    ] = "blocks",
+    limit: Annotated[
+        int, Field(description="返回条目上限（blocks/matches 条数或 text 截断字符数），0 表示不限", ge=0, le=500)
+    ] = 50,
+    fuzzy: Annotated[bool, Field(description="关键词是否模糊匹配，默认 true")] = True,
+) -> str:
+    """屏幕 OCR。"""
+    return await _guard(
+        _op_ocr,
+        region,
+        keyword,
+        mode,
+        limit,
+        fuzzy,
+        tool="ui_ocr",
+        audit_args={
+            "region": region,
+            "keyword": keyword,
+            "mode": mode,
+            "limit": limit,
+            "fuzzy": fuzzy,
+        },
+    )
+
+
+# ===================================================================== 启动
+def run_stdio(warmup: Optional[bool] = None) -> int:
+    """以 stdio 传输启动 MCP Server（阻塞直到客户端断开）。
+
+    :param warmup: 是否预热 COM 工作线程与 UIA 内核，缺省读环境变量 ``UI_AGENT_WARMUP``
+    """
+    _force_utf8_stdio()
+
+    # 1. 统一坐标系必须早于任何 GDI / 截图调用
+    from .dpi import enable_dpi_awareness
+
+    enable_dpi_awareness()
+
+    # 2. 日志固定走 stderr，避免污染 stdout 的 JSON-RPC 通道
+    from .logging_utils import setup_logging
+
+    setup_logging(os.environ.get("UI_AGENT_LOG_LEVEL", "INFO"))
+
+    # 3. 预热（默认开启）：提前初始化 COM 线程与 UIA 内核，降低首次调用延迟
+    if warmup is None:
+        warmup = os.environ.get("UI_AGENT_WARMUP", "1").lower() not in ("0", "false", "no")
+    if warmup:
+        try:
+            _UI.run(lambda controller: None, timeout=60.0)
+        except Exception as exc:  # pragma: no cover - 预热失败不影响服务启动
+            print(f"[ui-agent] 预热失败：{exc}", file=sys.stderr, flush=True)
+
+    server.run("stdio")
+    return 0
+
+
+def main() -> int:
+    """entry point。"""
+    return run_stdio()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

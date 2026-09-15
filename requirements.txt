@@ -1,0 +1,21 @@
+# ui-agent 运行依赖（CPython 3.12 / Windows x64）
+# 环境约定：使用 py -3.12 创建独立 venv，禁止使用系统 python 命令
+#   py -3.12 -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# --- 无障碍（Accessibility API）---
+uiautomation==2.0.29
+comtypes==1.4.16
+
+# --- OCR（CPU 推理）---
+rapidocr-onnxruntime==1.4.4
+onnxruntime==1.30.0
+
+# --- 执行层 ---
+pyautogui==0.9.54
+pyperclip==1.11.0
+
+# --- 图像 / 数值 ---
+opencv-python==5.0.0.93
+pillow==12.3.0
+numpy==2.5.3

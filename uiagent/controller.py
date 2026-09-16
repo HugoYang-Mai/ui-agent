@@ -180,6 +180,24 @@ def _ensure_v2_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+# ---------------------------------------------------------------- 关闭可靠性根治（改动点 C1~C5）
+#: 关闭通道：``wm_close``（默认，程序化直投 WM_CLOSE）/ ``alt_f4``（强制走键盘回退路径）
+_CLOSE_METHODS = ("wm_close", "alt_f4")
+
+#: 回退通道取值：``alt_f4``（默认，"WM_CLOSE 未收敛时补一次前台核验 + alt+f4"）/ ``off``（关闭）
+_CLOSE_FALLBACK_MODES = ("alt_f4", "off")
+
+
+def _close_fallback_mode() -> str:
+    """``UIAGENT_CLOSE_FALLBACK=off`` 时禁用 alt+f4 回退通道（改动点 C5）。
+
+    默认 ``alt_f4``：WM_CLOSE 未在轮询窗内收敛时，补"前台核验 → alt+f4"一次；
+    设 ``off`` 则完全不做任何键盘注入，未收敛直接返回阻断/降级结论。
+    """
+    raw = str(os.environ.get("UIAGENT_CLOSE_FALLBACK", "alt_f4") or "alt_f4").strip().lower()
+    return raw if raw in _CLOSE_FALLBACK_MODES else "alt_f4"
+
+
 @dataclass
 class AppContextEntry:
     """``app → {hwnd, bounds, state}`` 缓存条目（只读快照，不含任何控件句柄）。"""
@@ -574,6 +592,354 @@ class UniversalController:
                 detail=str(result.get("detail") or ""),
             )
         return result
+
+    def close_window(
+        self,
+        title: Optional[str] = None,
+        process_name: Optional[str] = None,
+        exact: bool = False,
+        hwnd: Optional[int] = None,
+        class_name: Optional[str] = None,
+        method: str = "wm_close",
+        timeout: float = 3.0,
+        poll_interval: float = 0.025,
+        require_foreground: bool = False,
+        fallback: Optional[str] = None,
+        dialog_scan: bool = True,
+    ) -> Dict[str, Any]:
+        """关闭窗口（写操作：程序化 ``WM_CLOSE`` 直投 + 轮询收敛，改动点 C1~C5）。
+
+        口径（关闭可靠性根治）：
+
+        * **C1 程序化通道**：``method="wm_close"``（默认）把 ``WM_CLOSE`` 直接投递到目标
+          HWND，不再依赖 ``alt+f4`` 的前台送达；``method="alt_f4"`` 强制走键盘回退路径。
+        * **C2 判定口径**：关闭成功以 **目标窗口句柄消失**（``IsWindow`` 为假）为准，
+          **不要求进程退出**——应用驻留后台属正常。
+        * **C3 模态框阻断**：句柄仍在且诊断到同进程模态对话框（未保存确认等）时，
+          返回 ``blocked=True`` + ``blocked_reason="modal_dialog"`` + ``dialogs``（含可见文本），
+          **交上层决策，绝不点击、绝不盲重试**。
+        * **C4 收敛等待**：关闭后按 ``poll_interval`` 轮询至 ``timeout``，替换旧的固定单次判定。
+        * **C5 回退开关**：``UIAGENT_CLOSE_FALLBACK=off``（或 ``fallback="off"``）是**键盘通道硬开关**——
+          任何键盘关闭按键都不发送（含显式 ``method="alt_f4"``：此时降级回 WM_CLOSE 通道并标注
+          ``degraded_reason="close_fallback_disabled"``）；默认 ``alt_f4`` 仅在 **无模态框** 且
+          **前台核验通过** 时补一次 ``alt+f4``（前台核验不通过则不发键，避免误关其它窗口）。
+
+        :return: ``{"ok", "closed", "hwnd", "window", "method_requested", "method_used",
+            "signal", "wait", "dialogs", "blocked", "blocked_reason", "degraded",
+            "degraded_reason", "foreground", "timing", "detail", "hints"?}``
+        """
+        from .accessibility import win32_windows as w32
+
+        requested = str(method or "wm_close").strip().lower()
+        if requested not in _CLOSE_METHODS:
+            return {
+                "ok": False,
+                "closed": False,
+                "hwnd": 0,
+                "error": f"method 仅支持 wm_close / alt_f4，收到 {method!r}",
+            }
+        fallback_mode = (
+            str(fallback).strip().lower() if fallback else _close_fallback_mode()
+        )
+        if fallback_mode not in _CLOSE_FALLBACK_MODES:
+            fallback_mode = _close_fallback_mode()
+        # C5：回退开关为 off 时属于"键盘通道硬开关"——任何按键都不发送；此时显式要求
+        # alt+f4 也不再拼装按键，而是降级回程序化 WM_CLOSE 通道，并标注降级原因（绝不空转）。
+        keyboard_disabled = fallback_mode == "off"
+        use_wm_close = requested == "wm_close" or keyboard_disabled
+        audit = get_audit_logger()
+        started = time.perf_counter()
+
+        # ---------------------------------------------------------- 定位与句柄核验（C4）
+        window = self.find_window(
+            title=title,
+            process_name=process_name,
+            exact=exact,
+            class_name=class_name,
+            hwnd=hwnd,
+        )
+        if window is None:
+            handle = int(hwnd or 0)
+            if handle and not w32.is_window(handle):
+                payload = {
+                    "ok": True,
+                    "closed": True,
+                    "already_closed": True,
+                    "hwnd": handle,
+                    "method_requested": requested,
+                    "method_used": "none",
+                    "detail": f"hwnd={handle} 已不是有效窗口（句柄消失，视为已关闭）",
+                    "timing": {"total_ms": round((time.perf_counter() - started) * 1000.0, 3)},
+                }
+                if audit is not None:
+                    audit.log_action(
+                        "close_window",
+                        title=title or "",
+                        process_name=process_name or "",
+                        hwnd=handle,
+                        found=False,
+                        closed=True,
+                        already_closed=True,
+                        method_requested=requested,
+                        method_used="none",
+                        detail=payload["detail"],
+                    )
+                return payload
+            report = window_miss_report(
+                title=title, process_name=process_name, hwnd=hwnd, exact=exact
+            )
+            payload = {
+                "ok": False,
+                "closed": False,
+                "hwnd": 0,
+                "method_requested": requested,
+                "method_used": "none",
+                "detail": (
+                    f"未找到匹配窗口（title={title!r} process_name={process_name!r} "
+                    f"hwnd={hwnd!r}）"
+                ),
+                "hints": report["hints"],
+                "candidates": report["candidates"],
+                "hidden_apps": report["hidden_apps"],
+                "total_windows": report["total_windows"],
+                "timing": {"total_ms": round((time.perf_counter() - started) * 1000.0, 3)},
+            }
+            if audit is not None:
+                audit.log_action(
+                    "close_window",
+                    title=title or "",
+                    process_name=process_name or "",
+                    hwnd=int(hwnd or 0),
+                    found=False,
+                    closed=False,
+                    method_requested=requested,
+                    method_used="none",
+                    detail=payload["detail"],
+                )
+            return payload
+
+        handle = int(getattr(window, "hwnd", 0) or hwnd or 0)
+        payload: Dict[str, Any] = {
+            "ok": False,
+            "closed": False,
+            "hwnd": handle,
+            "window": window.to_dict(),
+            "method_requested": requested,
+            "method_used": "none",
+        }
+
+        # 关闭前目标窗口核验（C4）：句柄必须仍然有效
+        if not handle or not w32.is_window(handle):
+            payload.update(
+                {
+                    "ok": True,
+                    "closed": True,
+                    "already_closed": True,
+                    "detail": f"hwnd={handle} 在关闭前已不是有效窗口（视为已关闭）",
+                }
+            )
+            payload["timing"] = {"total_ms": round((time.perf_counter() - started) * 1000.0, 3)}
+            if audit is not None:
+                audit.log_action(
+                    "close_window",
+                    title=title or "",
+                    process_name=process_name or "",
+                    hwnd=handle,
+                    found=True,
+                    closed=True,
+                    already_closed=True,
+                    method_requested=requested,
+                    method_used="none",
+                    detail=payload["detail"],
+                )
+            return payload
+
+        # 关闭前快照（供审计与上层判断"关的是哪个窗口"）
+        before = w32.window_from_hwnd(handle)
+        foreground_before = w32.get_foreground_hwnd()
+        payload["foreground_before"] = foreground_before
+        payload["foreground_matched_before"] = bool(foreground_before == handle)
+        payload["state_before"] = (
+            before.to_dict().get("state") if before is not None else w32.window_state(hwnd=handle)
+        )
+
+        # 可选：关闭前把目标置前（需要键盘回退、或宿主显式要求时使用）
+        foreground_step: Dict[str, Any] = {}
+        if require_foreground:
+            act = self.activate_window(hwnd=handle, wait_ready=True)
+            fg = w32.get_foreground_hwnd()
+            foreground_step = {
+                "activated": bool(act.get("activated")),
+                "foreground_hwnd": fg,
+                "matched": bool(fg == handle),
+                "state": act.get("state"),
+                "degraded": bool(act.get("degraded")),
+                "degraded_reason": str(act.get("degraded_reason") or ""),
+            }
+        payload["foreground"] = foreground_step
+
+        # ---------------------------------------------------------- C1/C4：WM_CLOSE 直投 + 轮询
+        if use_wm_close:
+            closed_result = self.accessibility.close_window(
+                hwnd=handle,
+                timeout=float(timeout),
+                poll_interval=float(poll_interval),
+                dialog_scan=bool(dialog_scan),
+            )
+            payload["signal"] = closed_result.get("signal")
+            payload["wait"] = closed_result.get("wait")
+            payload["timing"] = dict(closed_result.get("timing") or {})
+            payload["method_used"] = "wm_close"
+            if closed_result.get("closed"):
+                payload["closed"] = True
+            payload["dialogs"] = list(closed_result.get("dialogs") or [])
+            payload["close_detail"] = closed_result.get("detail")
+            if keyboard_disabled and requested == "alt_f4":
+                payload["degraded"] = True
+                payload["degraded_reason"] = "close_fallback_disabled"
+        else:
+            payload["dialogs"] = []
+
+        # ---------------------------------------------------------- C3/C5：回退与阻断
+        if not payload["closed"]:
+            if payload["dialogs"] and use_wm_close:
+                payload["blocked"] = True
+                payload["blocked_reason"] = "modal_dialog"
+                payload["degraded"] = True
+                payload["degraded_reason"] = "close_blocked_by_dialog"
+                payload["hint"] = (
+                    "检测到可能阻塞关闭的模态对话框：请先人工确认对话框内容（保存/放弃/取消），"
+                    "或由上层决定点哪个按钮；本能力不做任何猜测性点击与重试。"
+                )
+            elif keyboard_disabled:
+                payload["blocked"] = False
+                payload["blocked_reason"] = "window_still_alive"
+                payload["degraded"] = True
+                payload["degraded_reason"] = "close_fallback_disabled"
+                payload["hint"] = (
+                    "回退通道已由 UIAGENT_CLOSE_FALLBACK=off（或 fallback='off'）关闭，未发送任何键盘"
+                    "按键；WM_CLOSE 未在超时内收敛，窗口可能仍在关闭流程中，或应用忽略了关闭消息。"
+                    "如需键盘回退，请先确认目标窗口前台状态，并在开关允许时改用 require_foreground=true。"
+                )
+            else:
+                # 仅在"无模态框 + 前台核验通过"时补一次 alt+f4，避免误关其它窗口
+                act = self.activate_window(hwnd=handle, wait_ready=True)
+                fg = w32.get_foreground_hwnd()
+                matched = bool(fg == handle)
+                payload["foreground"] = dict(
+                    foreground_step or {},
+                    fallback_activated=bool(act.get("activated")),
+                    foreground_hwnd=fg,
+                    matched=matched,
+                    state=act.get("state"),
+                )
+                if not matched:
+                    payload["blocked"] = True
+                    payload["blocked_reason"] = "foreground_not_matched"
+                    payload["degraded"] = True
+                    payload["degraded_reason"] = "close_not_confirmed"
+                    payload["hint"] = (
+                        "关闭未收敛且目标窗口无法置为前台（前台锁定），已放弃 alt+f4 回退以免误关"
+                        "其它窗口；建议稍后重试，或先用 ui_activate_window 确认前台后再关闭。"
+                    )
+                else:
+                    self.hotkey("alt", "f4")
+                    payload["signal"] = {
+                        "channel": "keyboard_alt_f4",
+                        "delivered": True,
+                        "keys": ["alt", "f4"],
+                        "front_verified": True,
+                        "foreground_hwnd": fg,
+                    }
+                    wait = w32.wait_window_closed(
+                        handle,
+                        timeout=float(timeout),
+                        interval=float(poll_interval),
+                    )
+                    payload["wait"] = wait
+                    payload["method_used"] = (
+                        "alt_f4" if requested == "alt_f4" else "wm_close+alt_f4"
+                    )
+                    if wait.get("closed"):
+                        payload["closed"] = True
+                        payload.pop("blocked", None)
+                    else:
+                        rescan: List[Dict[str, Any]] = []
+                        if dialog_scan:
+                            try:
+                                rescan = w32.modal_window_candidates(handle)
+                            except Exception:  # pragma: no cover
+                                rescan = []
+                        if rescan:
+                            payload["dialogs"] = rescan
+                            payload["blocked"] = True
+                            payload["blocked_reason"] = "modal_dialog"
+                            payload["degraded"] = True
+                            payload["degraded_reason"] = "close_blocked_by_dialog"
+                        else:
+                            payload["blocked"] = False
+                            payload["blocked_reason"] = "window_still_alive"
+                            payload["degraded"] = True
+                            payload["degraded_reason"] = "close_not_confirmed"
+                            payload["hint"] = (
+                                "程序化关闭与 alt+f4 回退均未在超时内使句柄消失；窗口可能仍在关闭"
+                                "流程中，或应用忽略了关闭消息（未发现模态框），建议稍后重试。"
+                            )
+
+        # ---------------------------------------------------------- 收尾：状态与结论
+        payload["ok"] = bool(payload["closed"])
+        if payload["closed"]:
+            payload["state_after"] = "not_found"
+            payload["detail"] = (
+                f"窗口已关闭（句柄消失，method_used={payload['method_used']}）；"
+                "应用进程可能仍在后台驻留，属正常现象。"
+            )
+        else:
+            after = w32.window_from_hwnd(handle)
+            payload["state_after"] = (
+                after.to_dict().get("state") if after is not None else w32.window_state(hwnd=handle)
+            )
+            payload["detail"] = str(
+                payload.get("close_detail")
+                or f"窗口未关闭（state={payload['state_after']}，method_used={payload['method_used']}）"
+            )
+        timing = dict(payload.get("timing") or {})
+        timing["total_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+        timing.setdefault("signal_ms", 0.0)
+        timing.setdefault("wait_ms", float((payload.get("wait") or {}).get("waited_ms") or 0.0))
+        payload["timing"] = timing
+
+        if audit is not None:
+            wait_timing = payload.get("wait") or {}
+            audit.log_action(
+                "close_window",
+                title=title or "",
+                process_name=process_name or "",
+                hwnd=handle,
+                found=True,
+                closed=bool(payload["closed"]),
+                method_requested=requested,
+                method_used=str(payload["method_used"]),
+                signal_channel=str((payload.get("signal") or {}).get("channel") or ""),
+                signal_delivered=bool((payload.get("signal") or {}).get("delivered")),
+                waited_ms=float(wait_timing.get("waited_ms") or 0.0),
+                polls=int(wait_timing.get("polls") or 0),
+                blocked=bool(payload.get("blocked")),
+                blocked_reason=str(payload.get("blocked_reason") or ""),
+                dialogs_count=len(payload.get("dialogs") or []),
+                degraded=bool(payload.get("degraded")),
+                degraded_reason=str(payload.get("degraded_reason") or ""),
+                state_before=str(payload.get("state_before") or ""),
+                state_after=str(payload.get("state_after") or ""),
+                foreground_matched=bool(
+                    (payload.get("foreground") or {}).get("matched")
+                    if payload.get("foreground")
+                    else payload.get("foreground_matched_before")
+                ),
+                elapsed_ms=payload["timing"]["total_ms"],
+                detail=str(payload.get("detail") or ""),
+            )
+        return payload
 
     def get_focused_element(self) -> Optional[UIElement]:
         """当前键盘焦点元素。"""

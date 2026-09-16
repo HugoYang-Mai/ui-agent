@@ -1,20 +1,25 @@
 """ui-agent MCP Server（stdio 传输）。
 
 把 UIA + OCR 操控内核包装为本地 MCP Server，供 CowAgent / Marvis 等 MCP 客户端
-通过 stdio（JSON-RPC over stdin/stdout）调用。暴露 8 个工具：
+通过 stdio（JSON-RPC over stdin/stdout）调用。暴露 13 个工具：
 
-===========================  ============================================
-工具                          作用
-===========================  ============================================
-``ui_window_list``           枚举顶层窗口（含隐藏/托盘窗口，带可见性与应用标识）
-``ui_activate_window``       按 hwnd/标题/进程名把窗口置为前台（可唤醒隐藏窗口）
-``ui_find``                  定位元素/界面文字（UIA 优先，OCR 兜底）
-``ui_click``                 点击目标（定位式或坐标式）
-``ui_type``                  输入文本（中文自动走剪贴板）
-``ui_hotkey``                发送快捷键
-``ui_screenshot``            截屏保存到文件
-``ui_ocr``                   屏幕 OCR（文本块 / 关键词命中 / 整屏文本）
-===========================  ============================================
+==============================  ============================================
+工具                              作用
+==============================  ============================================
+``ui_window_list``               枚举顶层窗口（含隐藏/托盘窗口，带可见性与应用标识）
+``ui_activate_window``           按 hwnd/标题/进程名把窗口置为前台（可唤醒隐藏窗口）
+``ui_app_ensure``                统一入口：定位 + 就绪等待 + 置前，返回四状态分层
+``ui_app_status``                应用状态查询（visible/minimized/hidden/cloaked/not_running）
+``ui_launch_app``                受白名单保护的启动能力
+``ui_wait_window``               等待窗口出现/就绪（轮询收敛）
+``ui_find``                      定位元素/界面文字（UIA 优先，OCR 兜底）
+``ui_click``                     点击目标（定位式或坐标式）
+``ui_type``                      输入文本（中文自动走剪贴板）
+``ui_hotkey``                    发送快捷键
+``ui_close``                     关闭窗口（WM_CLOSE 直投 + 轮询，替代 alt+f4 拼装）
+``ui_screenshot``                截屏保存到文件
+``ui_ocr``                       屏幕 OCR（文本块 / 关键词命中 / 整屏文本）
+==============================  ============================================
 
 设计要点
 --------
@@ -745,6 +750,74 @@ def _op_hotkey(ctrl: Any, keys: Any, delay: float) -> Dict[str, Any]:
     return {"ok": True, "keys": combo, "sent_at": time.time()}
 
 
+def _resolve_app_hwnd(ctrl: Any, app: str) -> int:
+    """按应用名 / 进程名解析目标窗口句柄（只读，与 ``ui_app_status`` 同源）。
+
+    ``ui_close`` 的 ``app`` 语义与 ``ui_app_status`` / ``ui_app_ensure`` 一致——「应用别名 /
+    进程名」（如 ``记事本`` / ``notepad.exe``）。早期实现把它直接当标题匹配（``title=app``），
+    导致 ``ui_close(app="notepad.exe")`` 找不到标题不含进程名的窗口（如「xxx.txt - Notepad」）
+    而返回「未找到匹配窗口」。此处复用同一套应用解析拿句柄；解析失败（应用未运行等）返回 0，
+    由调用方退回标题匹配兜底。
+    """
+    try:
+        payload = ctrl.app_status(apps=[app], include_not_running=False)
+    except Exception:  # pragma: no cover - 解析异常一律退回标题匹配
+        return 0
+    for item in payload.get("apps") or []:
+        if not isinstance(item, dict):
+            continue
+        handle = int(item.get("hwnd") or 0)
+        if handle:
+            return handle
+    return 0
+
+
+def _op_close_window(
+    ctrl: Any,
+    target: Optional[str],
+    app: Optional[str],
+    hwnd: Optional[int],
+    exact: bool,
+    method: Optional[str],
+    timeout: float,
+    require_foreground: bool,
+    fallback: Optional[str],
+) -> Dict[str, Any]:
+    """关闭窗口（关闭可靠性根治 改动点 C1~C5）。
+
+    ``hwnd`` 优先；``target`` 为窗口标题；**仅给 ``app``** 时按「应用名 / 进程名」解析目标
+    窗口（与 ``ui_app_status`` 同口径），解析不到才退回「把 ``app`` 当标题」的旧兜底；
+    ``target`` 与 ``app`` 同时给出时，``app`` 作为进程校验条件（与 ``ui_activate_window``
+    同口径）。关闭成功判定以**句柄消失**为准，不要求进程退出。
+    """
+    requested = str(method or "wm_close").strip().lower()
+    if requested not in ("wm_close", "alt_f4"):
+        raise ValueError(f"method 仅支持 wm_close / alt_f4，收到 {method!r}")
+    fallback_mode = str(fallback or "").strip().lower() or None
+    if fallback_mode is not None and fallback_mode not in ("alt_f4", "off"):
+        raise ValueError(f"fallback 仅支持 alt_f4 / off，收到 {fallback!r}")
+    timeout_value = float(timeout) if timeout else 3.0
+    if not hwnd and not target and app:
+        # app 为「应用名 / 进程名」语义（对齐 ui_app_status / ui_app_ensure）：先按应用解析出
+        # 窗口句柄，避免把它误当标题匹配（如 app="notepad.exe" 对「xxx.txt - Notepad」）。
+        resolved = _resolve_app_hwnd(ctrl, app)
+        if resolved:
+            hwnd = resolved
+    title = target if target else (None if hwnd else app)
+    if not title and not hwnd:
+        raise ValueError("必须提供 target（窗口标题）/ app / hwnd 之一")
+    return ctrl.close_window(
+        title=title,
+        process_name=app if (app and target) else None,
+        hwnd=int(hwnd) if hwnd else None,
+        exact=bool(exact),
+        method=requested,
+        timeout=max(0.1, min(30.0, timeout_value)),
+        require_foreground=bool(require_foreground),
+        fallback=fallback_mode,
+    )
+
+
 def _op_screenshot(ctrl: Any, path: Optional[str], region: Any) -> Dict[str, Any]:
     rect = _parse_region(region)
     if path:
@@ -1341,6 +1414,85 @@ async def ui_hotkey(
         delay,
         tool="ui_hotkey",
         audit_args={"keys": keys, "delay": delay},
+    )
+
+
+@server.tool(
+    name="ui_close",
+    description=(
+        "关闭窗口（写操作），首选程序化通道：把 WM_CLOSE 直接投递到目标窗口句柄，"
+        "不再依赖 alt+f4 的前台送达；method='alt_f4' 可强制走键盘回退路径。"
+        "关闭后按 poll_interval 轮询收敛，成功判定以『目标窗口句柄消失（IsWindow 为假）』为准，"
+        "不要求进程退出（窗口关闭后应用驻留后台属正常）。"
+        "若句柄仍存活且诊断到同进程模态对话框（如未保存确认框），返回 blocked=true 与 dialogs "
+        "（含对话框标题/可见文本），交由上层决策，本工具不会盲目重试；"
+        "回退通道可用环境变量 UIAGENT_CLOSE_FALLBACK=off（或 fallback='off'）关闭：这是键盘通道"
+        "硬开关，关闭后不发任何关闭按键（显式 method='alt_f4' 也降级为 WM_CLOSE 并标注 "
+        "degraded_reason=close_fallback_disabled）；默认 alt_f4 仅在无模态框且前台核验通过时补一次 "
+        "alt+f4，避免误关其它窗口。"
+    ),
+)
+async def ui_close(
+    target: Annotated[
+        Optional[str], Field(description="窗口标题关键字（与 hwnd 同给时优先 hwnd；仅给 target 时按标题匹配）")
+    ] = None,
+    app: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "应用名或进程名（如 notepad.exe / 计算器）：仅给 app 时按应用解析目标窗口"
+                "（与 ui_app_status 同口径）；与 target 同给时作为进程校验条件"
+            )
+        ),
+    ] = None,
+    hwnd: Annotated[
+        int, Field(description="目标窗口句柄，优先于标题匹配（0 表示不使用）")
+    ] = 0,
+    exact: Annotated[bool, Field(description="标题是否精确匹配（默认包含匹配）")] = False,
+    method: Annotated[
+        str,
+        Field(
+            description="关闭通道：wm_close（默认，程序化 WM_CLOSE 直投）/ alt_f4（强制键盘回退）",
+            pattern="^(wm_close|alt_f4)$",
+        ),
+    ] = "wm_close",
+    timeout: Annotated[
+        float,
+        Field(description="关闭后的轮询收敛总超时（秒），默认 3.0", ge=0.1, le=30.0),
+    ] = 3.0,
+    require_foreground: Annotated[
+        bool, Field(description="关闭前是否先把目标窗口置为前台（默认 false，程序化通道无需置前）")
+    ] = False,
+    fallback: Annotated[
+        Optional[str],
+        Field(
+            description="回退通道覆盖：alt_f4 / off；缺省读环境变量 UIAGENT_CLOSE_FALLBACK（默认 alt_f4）",
+            pattern="^(alt_f4|off)$",
+        ),
+    ] = None,
+) -> str:
+    """关闭窗口。"""
+    return await _guard(
+        _op_close_window,
+        target,
+        app,
+        None if not hwnd else int(hwnd),
+        exact,
+        method,
+        timeout,
+        require_foreground,
+        fallback,
+        tool="ui_close",
+        audit_args={
+            "target": target,
+            "app": app,
+            "hwnd": hwnd,
+            "exact": exact,
+            "method": method,
+            "timeout": timeout,
+            "require_foreground": require_foreground,
+            "fallback": fallback,
+        },
     )
 
 

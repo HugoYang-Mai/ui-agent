@@ -55,6 +55,10 @@ DEGRADED_REASONS = (
     "launch_failed",            # 启动调用本身失败（P2）
     "not_allowlisted",          # 应用不在 UIAGENT_LAUNCH_ALLOWLIST 白名单内（P2，RF6）
     "ambiguous_candidates",     # 解析/匹配出多个候选，不自动选择（RF5）
+    "close_signal_undelivered",  # WM_CLOSE 未送达（目标消息队列不可用，C1）
+    "close_not_confirmed",      # WM_CLOSE 已投递但句柄未在超时内消失（C2/C4）
+    "close_blocked_by_dialog",  # 关闭被同进程模态框（未保存确认等）阻塞，交上层决策（C3）
+    "close_fallback_disabled",  # 回退通道被 UIAGENT_CLOSE_FALLBACK 关闭（C5）
 )
 
 

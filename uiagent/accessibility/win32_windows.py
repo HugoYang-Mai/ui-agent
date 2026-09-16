@@ -218,6 +218,24 @@ def _configure_win32() -> bool:
         _user32.SetWindowPos.restype = wintypes.BOOL
         _user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
         _user32.AttachThreadInput.restype = wintypes.BOOL
+        # 程序化关闭（改动点 C1）：WM_CLOSE 直投通道
+        _user32.PostMessageW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
+        _user32.PostMessageW.restype = wintypes.BOOL
+        _user32.SendMessageTimeoutW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.POINTER(wintypes.LPARAM),
+        ]
+        _user32.SendMessageTimeoutW.restype = wintypes.LPARAM
         _kernel32.GetCurrentThreadId.argtypes = []
         _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
         _kernel32.OpenProcess.argtypes = [wintypes.DWORD, ctypes.c_int, wintypes.DWORD]
@@ -766,6 +784,15 @@ BOUNDS_STABLE_TOLERANCE = 2
 BOUNDS_STABLE_MS = 150.0
 BOUNDS_STABLE_TIMEOUT = 3.0
 
+#: 程序化关闭（关闭可靠性根治 改动点 C1）：``WM_CLOSE`` 直投 + 轮询收敛参数。
+#: 关闭成功判定以「句柄消失」（``IsWindow`` 为假）为准，**不要求进程退出**。
+WM_CLOSE = 0x0010
+SMTO_BLOCK = 0x0001
+SMTO_ABORTIFHUNG = 0x0002
+CLOSE_SEND_TIMEOUT_MS = 2000
+CLOSE_POLL_INTERVAL_MS = 25
+CLOSE_POLL_TIMEOUT = 3.0
+
 
 def state_from_flags(visible: Any, iconic: Any, cloaked: Any = False) -> str:
     """由 ``visible`` / ``iconic`` / ``cloaked`` 布尔位推导统一状态（纯函数，零系统调用）。
@@ -907,6 +934,143 @@ def list_app_windows(
     if limit and int(limit) > 0:
         return ordered[: int(limit)]
     return ordered
+
+
+# ------------------------------------------------------------------ 程序化关闭（改动点 C1）
+#: Win32 标准对话框类名前缀（"未保存确认 / 另存为 / 打开"等系统对话框）
+DIALOG_CLASS_PREFIXES: Tuple[str, ...] = ("#32770",)
+
+
+def post_close(hwnd: int, timeout_ms: int = CLOSE_SEND_TIMEOUT_MS) -> Dict[str, Any]:
+    """向目标窗口投递 ``WM_CLOSE``（程序化关闭信号，不依赖前台焦点与键盘送达）。
+
+    分层实现：``SendMessageTimeoutW(SMTO_ABORTIFHUNG|SMTO_BLOCK)`` 优先——它能同步确认
+    目标线程已处理该消息，且目标挂起时按超时早退而不永久阻塞调用方；未送达时退回异步
+    ``PostMessageW``（仅入队，不确认处理）。
+
+    :return: ``{"delivered", "channel", "send_result", "hung", "error"}``
+        ``channel`` 取值 ``send_message_timeout`` / ``post_message``；``hung=True``
+        表示目标窗口消息队列无响应（超时早退）。
+    """
+    state: Dict[str, Any] = {
+        "delivered": False,
+        "channel": "",
+        "send_result": 0,
+        "hung": False,
+        "error": "",
+    }
+    if not hwnd or not _configure_win32():
+        state["error"] = "Win32 不可用或 hwnd 为空"
+        return state
+    handle = wintypes.HWND(int(hwnd))
+    if not _user32.IsWindow(handle):
+        state["error"] = f"hwnd={hwnd} 不是有效窗口（可能已关闭）"
+        return state
+
+    try:
+        outcome = wintypes.LPARAM(0)
+        sent = _user32.SendMessageTimeoutW(
+            handle,
+            WM_CLOSE,
+            0,
+            0,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            int(timeout_ms),
+            ctypes.byref(outcome),
+        )
+        state["send_result"] = int(getattr(outcome, "value", 0) or 0)
+        if sent:
+            state["delivered"] = True
+            state["channel"] = "send_message_timeout"
+            return state
+        err = int(ctypes.get_last_error() or 0)
+        state["error"] = f"SendMessageTimeoutW 未送达（GetLastError={err}）"
+        # SMTO_ABORTIFHUNG 早退时 LastError 常为 0：目标线程消息队列无响应
+        state["hung"] = err == 0
+    except Exception as exc:  # pragma: no cover - 极端环境 API 失败
+        state["error"] = f"SendMessageTimeoutW 异常：{exc}"
+
+    try:
+        posted = bool(_user32.PostMessageW(handle, WM_CLOSE, 0, 0))
+        if posted:
+            state["delivered"] = True
+            state["channel"] = "post_message"
+            state["error"] = ""
+        elif not state["error"]:
+            state["error"] = "PostMessageW 投递失败（目标消息队列不可用）"
+    except Exception as exc:  # pragma: no cover
+        state["error"] = state["error"] or f"PostMessageW 异常：{exc}"
+    return state
+
+
+def wait_window_closed(
+    hwnd: int,
+    timeout: float = CLOSE_POLL_TIMEOUT,
+    interval: float = CLOSE_POLL_INTERVAL_MS / 1000.0,
+) -> Dict[str, Any]:
+    """轮询等待窗口句柄消失（``IsWindow`` 为假），替代固定 ``sleep`` 单次判定。
+
+    :return: ``{"closed", "waited_ms", "polls", "timed_out", "visible", "iconic"}``
+        未关闭时附带最后一次采样的 ``visible`` / ``iconic``，供上层判断窗口处于何种状态。
+    """
+    started = time.perf_counter()
+    polls = 0
+    closed = not is_window(hwnd)
+    while not closed:
+        if (time.perf_counter() - started) >= max(0.0, float(timeout)):
+            break
+        time.sleep(max(0.005, float(interval)))
+        polls += 1
+        closed = not is_window(hwnd)
+    return {
+        "closed": bool(closed),
+        "waited_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        "polls": polls,
+        "timed_out": not closed,
+        "visible": None if closed else bool(is_window_visible(hwnd)),
+        "iconic": None if closed else is_iconic(hwnd),
+    }
+
+
+def modal_window_candidates(hwnd: int, limit: int = 8) -> List[Dict[str, Any]]:
+    """查找「疑似阻塞关闭的模态对话框」（只读诊断，绝不点击/按键/关闭）。
+
+    判定：同进程、非目标自身、可见未最小化，且满足任一"对话框"特征——类名以
+    ``#32770`` 开头（Win32 标准对话框）/ owner 直接指向目标窗口 / 存在 owner 且非主窗口。
+    owner 链指向目标窗口是最强信号：「未保存确认 / 另存为」等模态框都挂在被阻塞窗口上。
+    """
+    target_pid = get_pid_of_hwnd(hwnd)
+    out: List[Dict[str, Any]] = []
+    if not target_pid:
+        return out
+    for win in enum_top_level_windows():
+        if int(win.hwnd) == int(hwnd) or int(win.pid) != int(target_pid):
+            continue
+        if not win.visible or win.iconic:
+            continue
+        cls = str(win.class_name or "")
+        owner = int(win.owner_hwnd or 0)
+        is_dialog_class = cls.startswith(DIALOG_CLASS_PREFIXES)
+        owned_by_target = owner == int(hwnd)
+        if not (is_dialog_class or owned_by_target or owner):
+            continue
+        out.append(
+            {
+                "hwnd": int(win.hwnd),
+                "title": win.title,
+                "class_name": cls,
+                "pid": int(win.pid),
+                "owner_hwnd": owner,
+                "owned_by_target": bool(owned_by_target),
+                "is_dialog_class": bool(is_dialog_class),
+                "bounds": list(win.bounds),
+                "state": state_from_flags(win.visible, win.iconic, win.cloaked),
+            }
+        )
+    out.sort(key=lambda item: (not item["owned_by_target"], not item["is_dialog_class"]))
+    if limit and int(limit) > 0:
+        return out[: int(limit)]
+    return out
 
 
 # ------------------------------------------------------------------ 窗口唤醒

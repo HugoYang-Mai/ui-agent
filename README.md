@@ -13,7 +13,7 @@ AIGC:
 
 基于 **Windows UI Automation（UIA）+ RapidOCR（CPU）** 的鼠标定位与界面操控内核。
 
-定位策略为三级降级：**UIA 精确定位 → OCR 文字定位兜底 → 返回失败**。内核已通过 **MCP Server（stdio 传输）** 对外暴露 12 个 `ui_*` 工具，可供 CowAgent / Marvis 等 MCP 客户端直接接入；接入配置、工具参数与协议自测结论见 [`docs/mcp-server.md`](docs/mcp-server.md)；审计日志（调用链 / 定位方式 / 写操作明细）设计见 [`docs/audit-log-design.md`](docs/audit-log-design.md)。
+定位策略为三级降级：**UIA 精确定位 → OCR 文字定位兜底 → 返回失败**。内核已通过 **MCP Server（stdio 传输）** 对外暴露 13 个 `ui_*` 工具，可供 CowAgent / Marvis 等 MCP 客户端直接接入；接入配置、工具参数与协议自测结论见 [`docs/mcp-server.md`](docs/mcp-server.md)；审计日志（调用链 / 定位方式 / 写操作明细）设计见 [`docs/audit-log-design.md`](docs/audit-log-design.md)。
 
 窗口识别采用 **Win32 `EnumWindows` + UIA 双层**：隐藏 / 最小化到托盘的窗口同样可枚举，并可按 `hwnd` / 进程名 / 窗口类名 / 标题定位与激活，未命中时返回可执行的排查建议（详见第 7 节）；全部调用与写操作自动落审计日志（详见第 8 节）。
 
@@ -73,7 +73,7 @@ D:\Projects\ui-agent\
 │   ├── logging_utils.py                 # 运行日志（全部走 stderr，stdout 只承载结构化结果）
 │   ├── audit.py                         # 审计日志：JSONL 落盘、输入文本脱敏、run 归组、统计 / 跟读 / 回放
 │   ├── controller.py                    # UniversalController：统一门面（定位 / 点击 / 输入 / 窗口 / 审计埋点）
-│   ├── mcp_server.py                    # MCP Server：12 个 ui_* 工具 + COM 专用线程调度 + tool_call/tool_result/ensure/launch 埋点
+│   ├── mcp_server.py                    # MCP Server：13 个 ui_* 工具 + COM 专用线程调度 + tool_call/tool_result/ensure/launch 埋点
 │   ├── launcher.py                      # P2 启动链路：resolve / launch / wait_window（白名单 + dry_run + 别名表）
 │   ├── apps.yaml                        # P2 别名表（别名 → 可执行路径 / AUMID / 分级），可选、可删
 │   ├── accessibility\
@@ -180,6 +180,12 @@ ctrl.hotkey("ctrl", "s")
 
 > 两者**均为进程启动前置校验**：拒绝路径已用 `tasklist` 前后快照验证零进程产生（见第 7 节）。`resolve_app` 是只读解析，不受开关限制，可随时用于预演（等价于 `dry_run=true`）。
 
+关闭链路（关闭可靠性根治）环境开关：
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `UIAGENT_CLOSE_FALLBACK` | `alt_f4` | `ui_close` 的**键盘回退开关**：`alt_f4` → 程序化 `WM_CLOSE` 直投后若句柄仍在、且**无模态框**、**前台核验通过**（`GetForegroundWindow()==hwnd`）时补一次 `alt+f4`；`off` → **键盘通道硬开关**：不发任何关闭按键，显式 `method="alt_f4"` 亦降级回 `WM_CLOSE` 并标注 `degraded_reason=close_fallback_disabled`（绝不空转）；单次调用可用 `ui_close(fallback=…)` 覆盖 |
+
 ```python
 from uiagent import audit
 audit.audit_enabled()        # 总开关（UI_AGENT_AUDIT）
@@ -268,7 +274,7 @@ P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → �
 设计文档：[`docs/audit-log-design.md`](docs/audit-log-design.md)。用途：记录"谁在何时调用了什么、用了哪种定位方式、点了哪里、命中了哪个窗口"，便于调试与回归分析。**不改变任何工具签名与返回结构**，不写 stdout。
 
 - 载体：`uiagent/audit.py`，JSONL 落盘 `logs\audit-YYYYMMDD-<pid>.jsonl`（`logs\` 已 gitignore）；单文件超 10 MB 轮转为 `<同名>.1`，启动时清理超过保留天数的旧文件。
-- 八类事件：`tool_call` / `tool_result`（MCP 层，覆盖全部 12 个工具）、`locate`（定位明细：`source=uia|ocr|coords`、`fallback`、`uia_ms` / `ocr_ms`、候选数，以及 P0 的 `scope` / `scope_hwnd` / `cached`）、`ensure`（P1 应用唤起：`app` / `state` / `hwnd` / `activated` / `cached` / `ensure_ms` / `timing` / `degraded` / `degraded_reason`）、`launch`（P2 启动链路，已落盘：`app` / `resolved_by` / `target_path` / `pid` / `launch_ms` / `wait_ms` / `dry_run` / `degraded_reason`；被开关或白名单拒绝时同样落盘 `degraded_reason`）、`action`（写操作：点击坐标、`hit_window`、`auto_raise`、输入摘要）、`run_start` / `run_end`（按静默间隔切分的任务回放单元）。
+- 八类事件：`tool_call` / `tool_result`（MCP 层，覆盖全部 13 个工具）、`locate`（定位明细：`source=uia|ocr|coords`、`fallback`、`uia_ms` / `ocr_ms`、候选数，以及 P0 的 `scope` / `scope_hwnd` / `cached`）、`ensure`（P1 应用唤起：`app` / `state` / `hwnd` / `activated` / `cached` / `ensure_ms` / `timing` / `degraded` / `degraded_reason`）、`launch`（P2 启动链路，已落盘：`app` / `resolved_by` / `target_path` / `pid` / `launch_ms` / `wait_ms` / `dry_run` / `degraded_reason`；被开关或白名单拒绝时同样落盘 `degraded_reason`）、`action`（写操作：点击坐标、`hit_window`、`auto_raise`、输入摘要）、`run_start` / `run_end`（按静默间隔切分的任务回放单元）。
 - 脱敏（默认 `mask`）：只落 `input_len` + `input_sha256[:8]` + 首字符掩码预览（如 `老***`），**不落明文**；`hash` 只留长度与摘要，`full` 仅本地深度调试时使用。
 - 埋点：`mcp_server.py` 的 `_guard`、`controller.py` 的 `locate()` / `locate_many()`、`controller.py` 的 `ensure_app()`（P1 新增 `ensure` 事件）、`controller.py` 的 `launch_app()` / `wait_app_window()`（P2 新增 `launch` 事件）、`controller.py` 的写操作方法（`click` / `type_text` / `type_chinese` / `hotkey` / `activate_window`）。
 
@@ -304,7 +310,7 @@ P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → �
 - **置顶窗口遮挡**：置顶窗口会盖住同区域普通窗口；`activate_window` 返回 `covered` / `covered_by` / `hint`，`click` 会自动临时抬升目标窗口并返回 `auto_raise` / `hit_window`。
 - **输入法会拦截"纯 ASCII 串"的键盘输入**：`ui_type` 的 `auto` 分流是**整串级**——含中文走剪贴板，**纯 ASCII 串（如 `a1b2c3`）走键盘注入**，中文输入法激活时会被组字 / 候选吞掉或串码（实测 `a1b2c3` → `啊靶场`）。需要精确落字时显式 `method="clipboard"`，或先切英文输入法；剪贴板模式会**覆盖系统剪贴板**（内核不备份 / 恢复），输入后应回读校验（`chars` 只是发出字符数）。
 - **键盘类写操作前必须先取前台焦点**：`ui_type` / `ui_hotkey` 把按键发给**当前前台窗口的焦点控件**，二者都不负责置焦；`ctrl+s` / `alt+f4` 前先用 `ui_activate_window(hwnd=…)` 或 `ui_app_ensure(require_foreground=true)`，并复核 `activated` / `state`（`degraded_reason=foreground_locked` 表示窗口已唤醒但未占前台，此时发键可能落到别的窗口）。
-- **保存 / 关闭不能用 `ok=true` 判定**：`ctrl+s` 后回读磁盘（文件内容 / `mtime`）确认落盘（无路径的新文档会弹「另存为」）；`alt+f4` 前先保存（有未保存修改会弹确认框阻塞关闭），关闭成功以 **`hwnd` 消失**为准（`ui_window_list(include_invisible=true)` 中不再出现该 `hwnd`，等价 `user32.IsWindow(hwnd)==false`）。
+- **保存 / 关闭不能用 `ok=true` 判定**：`ctrl+s` 后回读磁盘（文件内容 / `mtime`）确认落盘（无路径的新文档会弹「另存为」）；关闭一律用 **`ui_close`**（程序化 `WM_CLOSE` 直投 + 轮询收敛，不依赖按键送达），成功以 **`hwnd` 消失**为准（`user32.IsWindow(hwnd)==false`，**不要求进程退出**）；遇未保存确认框等模态框时返回 `blocked=true` + `dialogs[]`，交上层决策、不盲重试。`alt+f4` 仅作条件化回退（`UIAGENT_CLOSE_FALLBACK` 可硬关）。仅给 `app` 时按**应用**解析目标窗口（别名 / 进程名，不再把 `app` 当标题）；应用当前无窗口（未运行或已全部关闭）返回 `ok=false` + `hints`，**属预期语义而非关闭失败**。
 - **`ui_app_status` 的 `state` 是"应用最优窗口"口径**：`select_best_window` 取「可见未最小化 > 可见已最小化 > 隐藏、同档面积最大」的窗口，多窗口应用隐藏其中一个后应用级 `state` 仍可能为 `visible`（**口径使然，不是缓存陈旧**）；判断特定窗口请按 `hwnd` 查 `candidates[].state`，或用 `ui_window_list(include_invisible=true)`。
 - **`AppContext` 缓存（`UIAGENT_CTX_TTL`，默认 30 s）只缓存"窗口线索"，不缓存状态**：`ui_app_status` 的 `state` 每次调用由实时枚举推导（`EnumWindows` + `IsWindowVisible` / `IsIconic` / cloaked），因此该变量**无法改善状态新鲜度**；`cached` / `cached_hwnd` / `cached_age_ms` 属历史线索，不得用于状态 / 关闭裁决。设 `UIAGENT_CTX_TTL=0` 只会关闭"窗口搜索域复用"（`ui_find` / `ui_click` 退化为桌面级定位、`ui_app_ensure` 每次重新枚举），属性能回退；个别调用想不读不写缓存可用 `reuse_ttl=0`。完整调用约定见 [`docs/mcp-server.md`](docs/mcp-server.md) §7.1。
 - **启动能力（P2）会真实拉起进程**：`ui_launch_app` / `ui_wait_window` 默认启用（`UIAGENT_LAUNCH_ENABLED=1`）；`UIAGENT_LAUNCH_ENABLED=0` 时整条链路直接拒绝（`degraded_reason=launch_disabled`，含 `dry_run`）；`UIAGENT_LAUNCH_ALLOWLIST` **默认启用安全白名单**：未设置 / 空白时套用内置默认白名单（只含记事本、计算器、画图、资源管理器、Edge、微信等常用应用，**不含** `cmd` / `powershell` / 终端等命令解释器），显式配置时以配置为准（可放开默认之外的入口），显式设为 `*` / `all` 表示不校验（显式解除限制）；不在生效白名单内 → `degraded_reason=not_allowlisted`，返回体 `hint` 标注拒绝来源与放开方式。建议先用 `dry_run=true` 预演解析结果再真实启动。`ensure_app` / `ui_app_ensure` 自身不启动进程，`launch_if_missing=true` 才交由启动链路接管；`degraded=true` 表示未达最优就绪状态而非失败。
@@ -332,7 +338,8 @@ P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → �
 | `ui_find` | 只读 | 定位元素或界面文字（UIA → OCR 兜底） |
 | `ui_click` | 写 | 定位式点击或坐标点击；目标点被置顶窗口遮挡时自动临时抬升目标窗口，返回 `auto_raise` / `hit_window` |
 | `ui_type` | 写 | 输入文本（含中文自动走剪贴板；**纯 ASCII 串走键盘注入，中文输入法激活时会被 IME 吞字 / 串码**，需精确落字时显式 `method="clipboard"`） |
-| `ui_hotkey` | 写 | 发送组合快捷键 |
+| `ui_hotkey` | 写 | 发送组合快捷键（发给**当前前台窗口**的焦点控件，关闭窗口请改用 `ui_close`） |
+| `ui_close` | 写 | 关闭窗口（关闭可靠性根治新增）：把 `WM_CLOSE` **直接投递到目标窗口**并轮询等句柄消失（`method="wm_close"` 默认；`alt_f4` 为条件化回退）；成功以 `closed`（`hwnd` 消失）为准，**不要求进程退出**；遇未保存确认框等模态框返回 `blocked=true` + `dialogs[]` 交上层决策；目标解析优先级 `hwnd` > `target`（标题）> `app`（**应用解析**：别名 / 进程名，与 `ui_app_status` 同源，不再把 `app` 误当标题），应用当前无窗口时返回 `ok=false` + `hints`（属预期语义，非关闭失败） |
 | `ui_screenshot` | 只读 | 截图落盘（全屏 / 区域） |
 | `ui_ocr` | 只读 | 屏幕 OCR（blocks / keyword / text） |
 
@@ -345,7 +352,9 @@ P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → �
 .\.venv\Scripts\python.exe -X utf8 selfcheck\mcp_selfcheck.py --include-write # 追加记事本端到端
 ```
 
-最近实测（2026-09-15）：`initialize` 握手 `2025-11-25`、`tools/list` 返回全部 12 个工具、`tools/call` 覆盖只读与写链路（含 P1 四状态用例与 P2 冷启动用例），**29/29 检查通过（passed=true，18.90 s）**；只读链路单独跑 **12/12（passed=true，7.05 s）**。P2 冷启动段实测（MCP 真实链路，记事本）：`ui_launch_app` `launch_ms=52.2` / `wait_ms=966.4`（`cold_ms=1018.6`，轻量级 SLA ≤1.5 s 通过）、`state=visible` / `hwnd=7473518` / `resolved_by=alias_table`；随后 `ui_app_ensure` 命中同一 `hwnd`（10.1 ms），`ui_wait_window(pid+app)` 698.1 ms 命中；`ui_launch_app(dry_run=true)`（`pid=0`）与 `ui_wait_window` 超时（返回 `state=launching`）均在只读链路断言通过。P1 `ui_app_ensure` 四状态实测（记事本，8 轮采样）：S1 `visible` P50 10.3 ms / P95 14.2 ms、S2 `minimized` P50 195.6 ms / P95 208.7 ms、S3 `hidden` P50 181.4 ms / P95 183.3 ms，均在 150 / 650 / 900 ms 预算内；S4 未启动 P50 43.0 ms，返回 8 个 `candidates` 与 `degraded_reason=app_not_running`。
+最近实测（2026-09-16 04:10，含 C0 目标解析修复）：`initialize` 握手 `2025-11-25`、`tools/list` 返回全部 13 个工具、`tools/call` 覆盖只读与写链路（含 P1 四状态用例与 P2 冷启动用例），**29/29 检查通过（passed=true，18.49 s）**；只读链路单独跑 **12/12（passed=true，7.05 s，2026-09-15 采集）**。P2 冷启动段实测（MCP 真实链路，记事本）：`ui_launch_app` `launch_ms=42.96` / `wait_ms=986.77`（`cold_ms=1029.7`，轻量级 SLA ≤1.5 s 通过）、`state=visible` / `hwnd=12453098` / `resolved_by=alias_table`；随后 `ui_app_ensure` 命中同一 `hwnd`（14.9 ms），`ui_wait_window(pid+app)` 678.2 ms 命中；**P2 前置关闭用例（`ui_close` 关闭记事本后 `ui_app_status` 复核 `state=not_running`）PASS**（修复前因 `app` 被误当标题匹配而连轮 `ok=false`、用例被 SKIP）；`ui_launch_app(dry_run=true)`（`pid=0`）与 `ui_wait_window` 超时（返回 `state=launching`）均在只读链路断言通过。P1 `ui_app_ensure` 四状态实测（记事本，8 轮采样，2026-09-15 采集）：S1 `visible` P50 10.3 ms / P95 14.2 ms、S2 `minimized` P50 195.6 ms / P95 208.7 ms、S3 `hidden` P50 181.4 ms / P95 183.3 ms，均在 150 / 650 / 900 ms 预算内；S4 未启动 P50 43.0 ms，返回 8 个 `candidates` 与 `degraded_reason=app_not_running`。
+
+关闭可靠性回归（真机，2026-09-16）：新链路 `ui_close`（`WM_CLOSE` 直投 + 句柄消失轮询）**50/50 首轮关闭成功**（记事本 25 + 计算器 25，0 补发、0 `blocked`）；C0 修复后复验 **30/30**（记事本 15 + 计算器 15）；改造前同环境 `alt+f4` 拼装链路 **0/20** 首轮成功（问题在送达 / 判定窗，非保存失败）。
 
 完整接入配置、逐工具参数表与故障排查见 [`docs/mcp-server.md`](docs/mcp-server.md)。
 
@@ -361,7 +370,7 @@ P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → �
 
 | # | 待开发项 | 一句话说明 | 来源 |
 | --- | --- | --- | --- |
-| 1 | 保存 / 关闭可靠性根治（含 `2/20` 窗口未关闭根因定位） | `ctrl+s` 后需回读磁盘、`alt+f4` 遇未保存修改会卡确认框，存在内容丢失风险；另有 2/20 次窗口在链路内未被关闭（`close_retry=2`，靠收尾兜底），根因尚未定位，需单独立项 | P0~P2 端到端提速验证（链 1 关闭环节） |
+| — | 暂无 | 「保存 / 关闭可靠性根治」已于 2026-09-16 落地（新增 `ui_close`：程序化 `WM_CLOSE` 直投 + 句柄消失判定 + 模态框阻断上报 + `app` 应用级目标解析（C0，修复自测中 `app` 被误当标题导致的关闭 miss）；真机 50/50 首轮关闭成功、C0 修复后复验 30/30，改造前同环境 0/20） | — |
 
 ### 建议做（覆盖面与性能）
 
@@ -371,6 +380,8 @@ P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → �
 | 3 | 重量级应用冷启动实测 | 当前只标定了轻量级 SLA（≤1.5 s），微信 / Office / IDE 的 `heavy ≤ 20 s` 目标尚未用实测校准 | P2 就绪等待预算（heavy 档为占位值） |
 | 4 | OCR 校验性能优化 | 记事本链路 OCR 校验单次 1903 ms、占该链路总耗时 58.4%，是剩余的大头；方向为区域裁剪、UIA 优先命中或降采样 | P0~P2 端到端提速验证：单步耗时定位 |
 | 5 | 记事本 unicode 直落残留换位 | 记事本档 unicode 通道实测 78/80（97.5%；另有 79/80 一次），2 例失败为相邻 `1` 与 `-` 换位（`bench-11-ok`→`bench1-1-ok`、`abc-123`→`abc1-23`），字符集合无损、仅顺序微错；30 轮双通道真值探针未能复现，疑为间歇性焦点 / 合成时序竞态，根因未定位。分档理由：有可校验目标值（unicode 档 100%） | 输入法吞字根治落地：M3 矩阵（记事本 20 轮 × 4 单元格 × 4 通道） |
+| 14 | 关闭能力在重量级 / 多窗口应用的样本覆盖 | 关闭回归目前只覆盖轻量单窗口应用（记事本 25 + 计算器 25，均 50/50）；微信（多窗口 + 托盘）、Qt / 浏览器多窗口、IDE 等「关一个窗口 ≠ 退出应用」的形态尚未实测，`select_best_window` 与 `hwnd` 生命周期的交互需补样本 | 关闭可靠性根治：真机回归样本盘点 |
+| 15 | `alt+f4` 回退通道的送达回执 | 程序化 `WM_CLOSE` 已是默认通道，但 `method="alt_f4"` 回退仍只做「发键前前台核验」；「核验通过但键落到别处」这一残余风险无回执可证，可考虑投递前后各记一次 `GetForegroundWindow()` 与目标 `hwnd` 一并返回 | 关闭可靠性根治：只读排查结论（原 `2/20` 卡点归因） |
 
 ### 可做（样本、灰度与设计取舍）
 
@@ -384,5 +395,6 @@ P2 冷启动实测（2026-09-15，均为"先关闭 → 内核发起启动 → �
 | 11 | 多候选不自动启动（RF5） | 命中多个候选时不自动选一个启动，避免误启无关应用，**属刻意设计，暂不处理** | P1 `ui_app_ensure` 设计决策 |
 | 12 | 冷启动就绪等待 980 ms 优化 | 就绪等待实测约 980 ms，绝大部分是**外部应用自身初始化耗时**，优化空间有限，暂不动 | P2 冷启动实测（`wait_ms≈966`） |
 | 13 | unicode 通道应用覆盖缺口 | VS Code（窗口可捕获但未定位到编辑区可读节点）、Windows Terminal（未定位文本元素）、微信（未识别输入框）三者的 unicode 通道未实测；Chrome 未安装，最终矩阵仅覆盖记事本与 Edge。分档理由：属样本 / 覆盖补充，不影响已实测链路正确性 | 输入法吞字根治落地：M3 侦察与最终矩阵 |
+| 16 | 模态框阻断后由内核代处置 | 遇未保存确认框时 `ui_close` 只做**只读诊断 + 阻断上报**（`blocked=true` + `dialogs[]`），不代点按钮；**属刻意设计**（不替用户决定「保存 / 丢弃」），保留上层决策权 | 关闭可靠性根治：C3 阻断语义设计 |
 
 *（内容由AI生成，仅供参考）*

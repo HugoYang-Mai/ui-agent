@@ -551,6 +551,148 @@ class WindowsAccessibility(AccessibilityBase):
                 )
         return result
 
+    def _dialog_text(self, hwnd: int, limit: int = 12) -> str:
+        """读取对话框内的可见文本（UIA Name，只读；失败返回空串，不抛异常）。"""
+        if not hwnd:
+            return ""
+        try:
+            control = auto.ControlFromHandle(int(hwnd))
+        except Exception:  # pragma: no cover - 句柄失效 / COM 异常
+            return ""
+        if control is None:
+            return ""
+        parts: List[str] = []
+
+        def _walk(node: Any, depth: int) -> None:
+            if depth > 3 or len(parts) >= limit:
+                return
+            try:
+                children = node.GetChildren()
+            except Exception:  # pragma: no cover
+                return
+            for child in children:
+                if len(parts) >= limit:
+                    return
+                name = self._safe(child, "Name", "") or ""
+                if isinstance(name, str) and name.strip():
+                    parts.append(name.strip())
+                _walk(child, depth + 1)
+
+        try:
+            _walk(control, 0)
+        except Exception:  # pragma: no cover
+            pass
+        return " / ".join(parts)[:200]
+
+    def close_window(
+        self,
+        target: Any = None,
+        hwnd: Optional[int] = None,
+        timeout: float = _w32.CLOSE_POLL_TIMEOUT,
+        poll_interval: float = _w32.CLOSE_POLL_INTERVAL_MS / 1000.0,
+        dialog_scan: bool = True,
+    ) -> Dict[str, Any]:
+        """向窗口投递 ``WM_CLOSE`` 并轮询确认句柄消失（写操作：程序化关闭通道）。
+
+        P3（关闭可靠性根治 改动点 C1/C2）：关闭不再依赖 ``alt+f4`` 的前台送达，
+        而是把 ``WM_CLOSE`` 直接投递到目标 HWND；成功判定以 ``IsWindow`` 为假
+        （句柄消失）为准，**不要求进程退出**（窗口关闭后应用驻留后台属正常）。
+
+        C3：若句柄未消失，只做**只读**模态框诊断并返回 ``blocked=True`` + ``dialogs``，
+        交上层决策；本方法**绝不**点击对话框、**绝不**重试、**绝不**强杀进程。
+
+        :return: ``{"closed", "hwnd", "window", "signal", "wait", "dialogs", "blocked",
+            "blocked_reason", "timing", "detail"}``
+        """
+        result: Dict[str, Any] = {"closed": False, "hwnd": 0, "detail": ""}
+
+        element: Optional[UIElement] = None
+        handle = int(hwnd or 0)
+        if not handle and target is not None:
+            if isinstance(target, int):
+                handle = int(target)
+            else:
+                control = self._native_of(target)
+                if control is None:
+                    result["detail"] = "目标不是有效的窗口控件"
+                    return result
+                element = target if isinstance(target, UIElement) else self._to_element(control)
+                handle = int(self._safe(control, "NativeWindowHandle", 0) or 0)
+                if not handle:
+                    handle = int(getattr(element, "hwnd", 0) or 0)
+        if not handle:
+            result["detail"] = "必须提供 target（窗口元素）或 hwnd"
+            return result
+
+        result["hwnd"] = handle
+        element = element or self.window_from_hwnd(handle)
+        if element is not None:
+            result["window"] = element.to_dict()
+
+        started = time.perf_counter()
+        if not _w32.is_window(handle):
+            result["closed"] = True
+            result["already_closed"] = True
+            result["detail"] = f"hwnd={handle} 已不是有效窗口（无需关闭）"
+            result["timing"] = {
+                "signal_ms": 0.0,
+                "wait_ms": 0.0,
+                "total_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            }
+            return result
+
+        signal_started = time.perf_counter()
+        signal = _w32.post_close(handle)
+        signal_ms = round((time.perf_counter() - signal_started) * 1000.0, 3)
+        result["signal"] = signal
+
+        wait = _w32.wait_window_closed(handle, timeout=timeout, interval=poll_interval)
+        result["wait"] = wait
+        result["closed"] = bool(wait.get("closed"))
+        result["timing"] = {
+            "signal_ms": signal_ms,
+            "wait_ms": float(wait.get("waited_ms") or 0.0),
+            "total_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        }
+        if result["closed"]:
+            result["detail"] = "窗口已关闭（句柄消失）"
+            return result
+
+        # C3：未关闭 → 只读诊断同进程可见模态框（对话框文本经 UIA 富化，便于上层决策）
+        dialogs: List[Dict[str, Any]] = []
+        if dialog_scan:
+            try:
+                dialogs = _w32.modal_window_candidates(handle)
+            except Exception:  # pragma: no cover - 诊断失败不影响关闭结论
+                dialogs = []
+            for item in dialogs:
+                text = self._dialog_text(int(item.get("hwnd") or 0))
+                if text:
+                    item["text"] = text
+        result["dialogs"] = dialogs
+
+        if dialogs:
+            result["blocked"] = True
+            result["blocked_reason"] = "modal_dialog"
+            names = "、".join(
+                str(d.get("title") or d.get("text") or f"hwnd={d.get('hwnd')}") for d in dialogs[:3]
+            )
+            result["detail"] = (
+                f"窗口未关闭：检测到 {len(dialogs)} 个可能阻塞的对话框（{names}）；"
+                "多为未保存确认类模态框，已交上层决策，未做任何点击/重试。"
+            )
+        else:
+            result["blocked"] = False
+            result["blocked_reason"] = "window_still_alive"
+            result["degraded"] = True
+            result["degraded_reason"] = "close_not_confirmed"
+            result["detail"] = (
+                f"WM_CLOSE 已投递（channel={signal.get('channel') or '无'}）但 "
+                f"{float(wait.get('waited_ms') or 0.0) / 1000.0:.2f}s 内句柄仍存活，"
+                "且未发现同进程模态框：窗口可能仍在关闭中，或应用忽略了 WM_CLOSE。"
+            )
+        return result
+
     def get_focused_element(self) -> Optional[UIElement]:
         """当前键盘焦点元素。"""
         try:

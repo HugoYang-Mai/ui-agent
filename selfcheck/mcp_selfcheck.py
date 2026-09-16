@@ -3,14 +3,14 @@
 以真实 MCP 客户端身份拉起 ``serve_mcp.py`` 子进程，走完整 stdio 协议链路：
 
 1. **握手**：``initialize`` → 校验协议版本 / serverInfo / capabilities
-2. **列工具**：``tools/list`` → 校验 12 个预期工具齐备并导出 inputSchema 摘要
+2. **列工具**：``tools/list`` → 校验 13 个预期工具齐备并导出 inputSchema 摘要
 3. **真实调用**：``tools/call``
    - 只读链路（默认）：``ui_window_list``（含 state 字段）/ ``ui_app_status`` / ``ui_launch_app``
      （``dry_run`` 预演）/ ``ui_wait_window``（超时降级）/ ``ui_find`` / ``ui_screenshot`` / ``ui_ocr``
    - 写链路（``--include-write``）：启动记事本打开自建临时文档 → 激活窗口 → **P1 四状态用例**
      （S1 可见 / S2 最小化 / S3 隐藏 / S4 未启动 + 耗时断言）→ 点击编辑区
      → 中文输入 → ``ctrl+s`` 保存 → 截图 → OCR 核验 → **P2 冷启动用例**
-     （``ui_launch_app`` 启动 + 就绪等待 + 启动后可定位）→ 关闭进程
+     （``ui_launch_app`` 启动 + 就绪等待 + 启动后可定位）→ ``ui_close`` 关闭窗口（程序化 ``WM_CLOSE``）
 
 用法::
 
@@ -50,6 +50,7 @@ EXPECTED_TOOLS = [
     "ui_click",
     "ui_type",
     "ui_hotkey",
+    "ui_close",
     "ui_screenshot",
     "ui_ocr",
 ]
@@ -294,25 +295,29 @@ async def _p1_state_scenario(
 
 
 async def _close_app_via_tools(call: Callable, app: str, rounds: int = 3, poll_s: float = 4.0) -> str:
-    """用 MCP 工具关闭目标应用（确认前台 → ``alt+f4``），返回轮询到的最终状态。
+    """用 MCP 工具关闭目标应用（``ui_close`` 程序化 ``WM_CLOSE`` → 轮询收敛），返回最终状态。
 
-    先激活并核对前台窗口确实属于目标应用，再发送 ``alt+f4``；每轮最多等 ``poll_s`` 秒。
+    关闭判定以 ``ui_close`` 的 ``closed``（目标 ``hwnd`` 消失）为准；若返回 ``blocked``
+    （未保存确认框等模态对话框阻断），只报阻断信息并交上层处置，**不盲目重试**。
     """
     state = ""
     for idx in range(max(1, rounds)):
         try:
-            await call("ui_activate_window", {"process_name": app})
+            # 优先按应用解析出的 hwnd 定向关闭（最稳；同应用多窗口时逐轮收敛），
+            # 解析不到 hwnd 再退回 app 解析路径（与 ui_app_status 同口径）。
+            item = ((await call("ui_app_status", {"apps": [app]})).get("apps") or [{}])[0]
+            handle = int(item.get("hwnd") or 0)
+            args = {"hwnd": handle, "timeout": 3.0} if handle else {"app": app, "timeout": 3.0}
+            closed = await call("ui_close", args)
         except Exception as exc:  # pragma: no cover - 清理路径
-            print(f"  [warn] 激活 {app} 失败：{exc}")
-        listing = await call("ui_window_list", {"include_hidden": True})
-        foreground = listing.get("foreground_window") or {}
-        fg = f"{foreground.get('process_name', '')} {foreground.get('title', '')}".lower()
-        if app.rsplit(".", 1)[0].lower() not in fg:
-            print(f"  [warn] 前台窗口不是目标应用（fg={fg!r}），仍尝试发送 alt+f4")
-        try:
-            await call("ui_hotkey", {"keys": "alt+f4"})
-        except Exception as exc:  # pragma: no cover - 清理路径
-            print(f"  [warn] 发送 alt+f4 失败：{exc}")
+            print(f"  [warn] ui_close 关闭 {app} 失败：{exc}")
+            break
+        if closed.get("blocked"):
+            titles = " / ".join(
+                str(d.get("title") or d.get("hwnd")) for d in (closed.get("dialogs") or [])
+            ) or "(未命名)"
+            print(f"  [warn] {app} 被模态对话框阻断关闭（dialogs={titles}），交上层处置")
+            break
         deadline = time.time() + poll_s
         while time.time() < deadline:
             item = ((await call("ui_app_status", {"apps": [app]})).get("apps") or [{}])[0]
@@ -320,7 +325,7 @@ async def _close_app_via_tools(call: Callable, app: str, rounds: int = 3, poll_s
             if state == "not_running":
                 return state
             await asyncio.sleep(0.4)
-        print(f"  [warn] 第 {idx + 1} 轮 alt+f4 未关闭 {app}（state={state}），重试")
+        print(f"  [warn] 第 {idx + 1} 轮 ui_close 后 {app} 仍未退出（state={state}），重试")
     return state
 
 
@@ -526,9 +531,8 @@ async def _write_scenario(call: Callable, report: Dict[str, Any], out_dir: str, 
         await _p2_cold_start_scenario(call, report, proc)
     finally:
         try:
-            await call("ui_activate_window", {"process_name": "notepad.exe"})
-            await call("ui_hotkey", {"keys": "alt+f4"})
-            await asyncio.sleep(1.2)
+            await call("ui_close", {"app": "notepad.exe", "timeout": 3.0})
+            await asyncio.sleep(0.6)
         except Exception as exc:  # pragma: no cover - 清理路径
             print(f"  [warn] 关闭记事本失败：{exc}")
         if proc.poll() is None:

@@ -59,6 +59,8 @@ DEGRADED_REASONS = (
     "close_not_confirmed",      # WM_CLOSE 已投递但句柄未在超时内消失（C2/C4）
     "close_blocked_by_dialog",  # 关闭被同进程模态框（未保存确认等）阻塞，交上层决策（C3）
     "close_fallback_disabled",  # 回退通道被 UIAGENT_CLOSE_FALLBACK 关闭（C5）
+    "close_disabled",           # 关闭能力被 UIAGENT_CLOSE_ENABLED=0 禁用（C6）
+    "close_not_allowlisted",    # 目标窗口不在 UIAGENT_CLOSE_ALLOWLIST 白名单内（C6）
 )
 
 

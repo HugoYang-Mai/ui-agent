@@ -198,6 +198,155 @@ def _close_fallback_mode() -> str:
     return raw if raw in _CLOSE_FALLBACK_MODES else "alt_f4"
 
 
+# ---------------------------------------------------------------- 关闭能力权限闸（改动点 C6）
+#: 关闭能力总开关（``UIAGENT_CLOSE_ENABLED``，默认 ``1``）：设 ``0`` 时 ``ui_close`` 整条链路
+#: 直接拒绝——不做任何窗口定位、不投递 ``WM_CLOSE``、不注入任何键盘按键。
+CLOSE_ENABLED_ENV = "UIAGENT_CLOSE_ENABLED"
+
+#: 关闭白名单（``UIAGENT_CLOSE_ALLOWLIST``，逗号分隔）：按「应用别名 / 进程名 / 窗口标题」匹配。
+CLOSE_ALLOWLIST_ENV = "UIAGENT_CLOSE_ALLOWLIST"
+
+#: 内置默认关闭白名单（**安全默认**，改动点 C6）：``UIAGENT_CLOSE_ALLOWLIST`` 未设置或为空白时
+#: 生效，只含常用 GUI 应用；**刻意不含** ``cmd`` / ``powershell`` / ``pwsh`` / ``wt``（Windows 终端）
+#: / ``taskmgr`` / ``regedit`` 等命令解释器与系统管理工具——关闭这类窗口等价于中断正在运行的
+#: 命令或系统配置，需要时必须由调用方在 env 中显式配置（或设为 ``*`` / ``all`` 显式解除限制）。
+DEFAULT_CLOSE_ALLOWLIST: Tuple[str, ...] = (
+    "notepad.exe",
+    "记事本",
+    "calc.exe",
+    "计算器",
+    "mspaint.exe",
+    "画图",
+    "explorer.exe",
+    "资源管理器",
+    "文件资源管理器",
+    "msedge.exe",
+    "weixin.exe",
+    "微信",
+)
+
+#: 显式解除关闭白名单限制的取值（``UIAGENT_CLOSE_ALLOWLIST`` 设为其中之一 → 不校验）
+CLOSE_ALLOWLIST_UNRESTRICTED_TOKENS: Tuple[str, ...] = ("*", "all")
+
+#: 关闭开关的假值集合（与 :data:`uiagent.launcher._flag` 同口径）
+_CLOSE_FALSE_VALUES: Tuple[str, ...] = ("0", "false", "no", "off", "n", "f")
+
+
+def _close_flag(name: str, default: str = "1") -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        raw = default
+    return str(raw).strip().lower() not in _CLOSE_FALSE_VALUES
+
+
+def close_enabled() -> bool:
+    """关闭能力总开关（``UIAGENT_CLOSE_ENABLED``，默认 ``1``）。"""
+    return _close_flag(CLOSE_ENABLED_ENV, "1")
+
+
+def _close_token_norm(value: Any) -> str:
+    return str(value or "").strip().strip('"').strip("'").lower()
+
+
+def _close_token_stem(value: Any) -> str:
+    text = _close_token_norm(value)
+    for suffix in (".exe", ".lnk", ".com", ".bat"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+    return text
+
+
+def _close_basename(value: Any) -> str:
+    return str(value or "").replace("/", "\\").rsplit("\\", 1)[-1].lower()
+
+
+def close_allowlist_raw() -> Tuple[str, ...]:
+    """解析 ``UIAGENT_CLOSE_ALLOWLIST`` 原值（逗号分隔；未设置 / 空 → 空元组，**不套默认值**）。"""
+    raw = str(os.environ.get(CLOSE_ALLOWLIST_ENV, "") or "")
+    return tuple(item.strip().lower() for item in raw.split(",") if item.strip())
+
+
+def close_allowlist_config() -> Dict[str, Any]:
+    """计算**生效**关闭白名单配置（安全默认化的唯一入口）。
+
+    :return: ``{"items": 生效条目, "source": "default" | "env" | "unrestricted",
+        "unrestricted": bool, "explicit": bool}``
+
+    语义（与 ``UIAGENT_LAUNCH_ALLOWLIST`` 对齐）：
+
+    * env 未设置 / 空白 → ``source="default"``，套用 :data:`DEFAULT_CLOSE_ALLOWLIST`
+      （**安全默认：不放开任意窗口关闭**）；
+    * env 显式配置（非空） → ``source="env"``，以配置为准；
+    * env 显式设为 ``*`` / ``all`` → ``unrestricted=True``，不校验（显式解除限制入口，需显式操作）。
+    """
+    items = close_allowlist_raw()
+    explicit = bool(items)
+    if not explicit:
+        return {
+            "items": tuple(DEFAULT_CLOSE_ALLOWLIST),
+            "source": "default",
+            "unrestricted": False,
+            "explicit": False,
+        }
+    if any(item in CLOSE_ALLOWLIST_UNRESTRICTED_TOKENS for item in items):
+        return {"items": (), "source": "unrestricted", "unrestricted": True, "explicit": True}
+    return {"items": items, "source": "env", "unrestricted": False, "explicit": True}
+
+
+def close_allowlist() -> Tuple[str, ...]:
+    """生效关闭白名单条目（解除限制时为 ``()``）。"""
+    return tuple(close_allowlist_config()["items"])
+
+
+def close_allowlist_check(
+    app: Any = "",
+    title: Any = "",
+    process_name: Any = "",
+    target: Any = "",
+) -> Dict[str, Any]:
+    """校验目标窗口是否允许关闭（**默认启用安全白名单**，改动点 C6）。
+
+    命中口径：进程名 / 应用别名 / 目标文件名（含去后缀形式）**精确命中**白名单条目，
+    或窗口标题**包含**白名单条目（如 ``记事本`` 命中标题 ``未命名 - 记事本``）。
+
+    :return: ``{"ok", "checked", "allowlist", "source", "tokens"?, "matched"?}``
+    """
+    config = close_allowlist_config()
+    if config["unrestricted"]:
+        return {"ok": True, "checked": False, "allowlist": [], "source": "unrestricted"}
+    allow = tuple(config["items"])
+    allow_set = {item for item in allow} | {_close_token_stem(item) for item in allow}
+    process_tokens = {
+        token
+        for token in (
+            _close_token_norm(process_name),
+            _close_token_stem(process_name),
+            _close_token_norm(_close_basename(target)),
+            _close_token_stem(_close_basename(target)),
+            _close_token_norm(app),
+            _close_token_stem(app),
+        )
+        if token
+    }
+    title_tokens = {token for token in (_close_token_norm(title),) if token}
+    matched = sorted(process_tokens & allow_set)
+    if not matched:
+        for keyword in sorted(allow_set):
+            if not keyword:
+                continue
+            if any(keyword in token for token in title_tokens):
+                matched.append(f"title~{keyword}")
+                break
+    return {
+        "ok": bool(matched),
+        "checked": True,
+        "allowlist": list(allow),
+        "source": str(config["source"]),
+        "tokens": sorted(process_tokens | title_tokens),
+        "matched": matched,
+    }
+
+
 @dataclass
 class AppContextEntry:
     """``app → {hwnd, bounds, state}`` 缓存条目（只读快照，不含任何控件句柄）。"""
@@ -623,10 +772,17 @@ class UniversalController:
           任何键盘关闭按键都不发送（含显式 ``method="alt_f4"``：此时降级回 WM_CLOSE 通道并标注
           ``degraded_reason="close_fallback_disabled"``）；默认 ``alt_f4`` 仅在 **无模态框** 且
           **前台核验通过** 时补一次 ``alt+f4``（前台核验不通过则不发键，避免误关其它窗口）。
+        * **C6 权限闸（安全默认收紧）**：``UIAGENT_CLOSE_ENABLED=0`` → 整条链路直接拒绝
+          （``degraded_reason="close_disabled"``，不定位、不投递、不发键）；
+          ``UIAGENT_CLOSE_ALLOWLIST`` **默认启用安全白名单**——未设置 / 空白时套用
+          :data:`DEFAULT_CLOSE_ALLOWLIST`（常用 GUI 应用，不含 ``cmd`` / ``powershell`` /
+          终端 / ``taskmgr`` 等），命中失败返回 ``degraded_reason="close_not_allowlisted"``
+          且不发送任何关闭信号；显式配置以配置为准，设为 ``*`` / ``all`` 表示不校验。
 
         :return: ``{"ok", "closed", "hwnd", "window", "method_requested", "method_used",
             "signal", "wait", "dialogs", "blocked", "blocked_reason", "degraded",
-            "degraded_reason", "foreground", "timing", "detail", "hints"?}``
+            "degraded_reason", "foreground", "timing", "detail", "hints"?,
+            "allowlist"?, "allowlist_source"?, "allowlist_tokens"?}``
         """
         from .accessibility import win32_windows as w32
 
@@ -649,6 +805,39 @@ class UniversalController:
         use_wm_close = requested == "wm_close" or keyboard_disabled
         audit = get_audit_logger()
         started = time.perf_counter()
+
+        # ---------------------------------------------------------- C6：能力总开关（先于任何定位与发送）
+        if not close_enabled():
+            payload = {
+                "ok": False,
+                "closed": False,
+                "hwnd": int(hwnd or 0),
+                "method_requested": requested,
+                "method_used": "none",
+                "degraded": True,
+                "degraded_reason": "close_disabled",
+                "detail": (
+                    f"关闭能力已禁用（{CLOSE_ENABLED_ENV}=0）：未做任何窗口定位、未投递 "
+                    "WM_CLOSE、未注入任何键盘按键"
+                ),
+                "hint": f"如需恢复关闭能力：设置 {CLOSE_ENABLED_ENV}=1 并重启 MCP 服务",
+                "timing": {"total_ms": round((time.perf_counter() - started) * 1000.0, 3)},
+            }
+            if audit is not None:
+                audit.log_action(
+                    "close_window",
+                    title=title or "",
+                    process_name=process_name or "",
+                    hwnd=int(hwnd or 0),
+                    found=False,
+                    closed=False,
+                    method_requested=requested,
+                    method_used="none",
+                    degraded=True,
+                    degraded_reason="close_disabled",
+                    detail=payload["detail"],
+                )
+            return payload
 
         # ---------------------------------------------------------- 定位与句柄核验（C4）
         window = self.find_window(
@@ -719,7 +908,62 @@ class UniversalController:
             return payload
 
         handle = int(getattr(window, "hwnd", 0) or hwnd or 0)
-        payload: Dict[str, Any] = {
+
+        # ---------------------------------------------------------- C6：白名单闸（发送前的最后一道门）
+        window_title = str(getattr(window, "title", "") or title or "")
+        window_process = str(getattr(window, "process_name", "") or process_name or "")
+        allowed = close_allowlist_check(
+            app=process_name or "",
+            title=window_title,
+            process_name=window_process,
+            target=process_name or "",
+        )
+        if not allowed["ok"]:
+            source_label = (
+                "内置默认关闭白名单"
+                if allowed.get("source") == "default"
+                else f"{CLOSE_ALLOWLIST_ENV} 显式配置"
+            )
+            payload: Dict[str, Any] = {
+                "ok": False,
+                "closed": False,
+                "hwnd": handle,
+                "window": window.to_dict(),
+                "method_requested": requested,
+                "method_used": "none",
+                "degraded": True,
+                "degraded_reason": "close_not_allowlisted",
+                "allowlist": list(allowed.get("allowlist") or []),
+                "allowlist_source": str(allowed.get("source") or ""),
+                "allowlist_tokens": list(allowed.get("tokens") or ()),
+                "detail": (
+                    f"目标窗口不在{source_label}内（title={window_title!r}，"
+                    f"process={window_process!r}）：未投递 WM_CLOSE，未注入任何键盘按键"
+                ),
+                "hint": (
+                    f"如需放开：设置 {CLOSE_ALLOWLIST_ENV}（逗号分隔，应用别名 / 进程名 / 窗口标题"
+                    f"关键词，如 notepad.exe,记事本）覆盖默认白名单；设为 "
+                    f"{' / '.join(CLOSE_ALLOWLIST_UNRESTRICTED_TOKENS)} 表示不校验（显式解除限制）。"
+                ),
+                "timing": {"total_ms": round((time.perf_counter() - started) * 1000.0, 3)},
+            }
+            if audit is not None:
+                audit.log_action(
+                    "close_window",
+                    title=window_title,
+                    process_name=window_process,
+                    hwnd=handle,
+                    found=True,
+                    closed=False,
+                    method_requested=requested,
+                    method_used="none",
+                    degraded=True,
+                    degraded_reason="close_not_allowlisted",
+                    detail=payload["detail"],
+                )
+            return payload
+
+        payload = {
             "ok": False,
             "closed": False,
             "hwnd": handle,

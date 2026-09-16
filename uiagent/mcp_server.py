@@ -1430,6 +1430,11 @@ async def ui_hotkey(
         "硬开关，关闭后不发任何关闭按键（显式 method='alt_f4' 也降级为 WM_CLOSE 并标注 "
         "degraded_reason=close_fallback_disabled）；默认 alt_f4 仅在无模态框且前台核验通过时补一次 "
         "alt+f4，避免误关其它窗口。"
+        "权限闸（安全默认收紧）：UIAGENT_CLOSE_ENABLED=0 时整条链路直接拒绝"
+        "（degraded_reason=close_disabled，不定位、不投递、不发键）；UIAGENT_CLOSE_ALLOWLIST 默认"
+        "启用安全白名单（未配置时套用内置默认：常用 GUI 应用，不含 cmd / powershell / 终端 / "
+        "taskmgr 等命令解释器与系统管理工具），命中失败返回 degraded_reason=close_not_allowlisted "
+        "且不发送任何关闭信号；显式配置以配置为准，设为 * / all 表示不校验（显式解除限制）。"
     ),
 )
 async def ui_close(

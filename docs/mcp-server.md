@@ -76,6 +76,8 @@ $env:PYTHONUTF8=1
 | `UI_AGENT_SEARCH_TIMEOUT` | `2.0` | UIA 元素查找超时（秒） |
 | `UI_AGENT_OUTPUT_DIR` | 系统临时目录下 `ui-agent\shots` | `ui_screenshot` 不传 `path` 时的落盘目录 |
 | `UIAGENT_CLOSE_FALLBACK` | `alt_f4` | **关闭回退开关（关闭可靠性根治新增）**：控制 `ui_close` 的 `alt+f4` 键盘回退通道。`alt_f4`（默认）→ 程序化 `WM_CLOSE` 直投后若句柄仍在，且**无模态框**、**前台核验通过**（`GetForegroundWindow()==hwnd`）时补一次 `alt+f4`；`off` → **键盘通道硬开关**：不发任何关闭按键，显式 `method="alt_f4"` 也降级回 `WM_CLOSE` 通道并标注 `degraded_reason="close_fallback_disabled"`（绝不空转）。进程启动时读取一次，改后需**重启 MCP 服务**生效；单次调用可用 `ui_close` 的 `fallback=` 覆盖 |
+| `UIAGENT_CLOSE_ENABLED` | `1` | **关闭能力总开关（C6 权限闸）**：`0` 时 `ui_close` 整条链路直接拒绝（`ok=false` + `degraded_reason="close_disabled"`，`method_used="none"`）：**不做窗口定位、不投递 `WM_CLOSE`、不注入任何键盘按键**；用于一键关闭"窗口关闭"这一写能力。改后需**重启 MCP 服务**生效 |
+| `UIAGENT_CLOSE_ALLOWLIST` | 未设置 → **内置默认白名单**（安全默认） | **关闭白名单（C6 权限闸）**（逗号分隔，按「应用别名 / 进程名 / 窗口标题关键词」匹配，大小写不敏感）。三种取值语义：①**未设置 / 空白** → 套用内置默认白名单 `DEFAULT_CLOSE_ALLOWLIST`（常用 GUI 应用：记事本、计算器、画图、资源管理器、Edge、微信；**刻意不含** `cmd` / `powershell` / `pwsh` / 终端 / `taskmgr` / `regedit` 等命令解释器与系统管理工具）；②**显式配置**（非空）→ **以配置为准**，整体替换默认白名单；③**显式设为 `*` 或 `all`** → 不校验（显式解除限制入口，需人为设置）。校验不通过时返回 `ok=false` + `degraded_reason="close_not_allowlisted"`（返回体 `allowlist` / `allowlist_source`（`default` / `env`）/ `hint` 标注拒绝来源与放开方式），**不发送任何关闭信号**，并落审计告警。改后需**重启 MCP 服务**生效 |
 | `UIAGENT_CTX_TTL` | `30`（秒） | **P0 `AppContext` 缓存 TTL**：缓存 `app → {hwnd, bounds, title, process_name, state}` 这条"窗口线索"，供 `ui_find` / `ui_click` 的 `scope=auto` 搜索域复用、`ui_activate_window` / `ui_app_ensure` 的 hwnd 快捷定位使用（避免每次退化为桌面级全树搜索）。`0` = **完全关闭**（不读不写，定位每次重新枚举，P0 提速收益回退）。进程启动时读取一次，改后需**重启 MCP 服务**生效；单次调用可用 `ui_find` / `ui_click` 的 `reuse_ttl` 覆盖（`0` = 本次不读不写，上限 600 s）。**该缓存只缓存"窗口线索"，不缓存状态：`ui_app_status` 的 `state` 每次调用实时推导，不受此变量影响**（详见《输入法与焦点调用约定》第四节） |
 | `UIAGENT_ENSURE_V2` | `1` | 应用唤起回退开关（P1）：`1` 走「状态判定 S1~S4 → 唤醒 / 置前 → 就绪确认」新链路；`0` 时 `ui_app_ensure` 退化为 `find_window` + `activate_window` 旧链路（命中窗口时 `state="unknown"`、不做 bounds 稳定等待，`timing` 仅 `snapshot_ms` / `total_ms`；未命中同样返回 `state="not_running"` 但不带 `candidates`），用于线上快速回滚 |
 | `UIAGENT_LAUNCH_ENABLED` | `1` | **P2 启动能力总开关**：`0` 时 `ui_launch_app` 整条链路直接拒绝（含 `dry_run`），返回 `ok=false` + `degraded_reason="launch_disabled"`，且不产生任何进程；用于线上快速关闭"启动未运行应用"这一高风险能力 |
@@ -374,7 +376,7 @@ $env:PYTHONUTF8=1
 | `require_foreground` | bool | `false` | 关闭前是否先把目标窗口置前（程序化通道无需置前） |
 | `fallback` | str | — | 回退通道覆盖：`alt_f4` / `off`；缺省读 `UIAGENT_CLOSE_FALLBACK`（默认 `alt_f4`） |
 
-返回：`ok / closed / already_closed? / hwnd / window / method_requested / method_used / signal / wait / state_after / dialogs / blocked / blocked_reason / degraded / degraded_reason / foreground / timing / detail / hints?`。
+返回：`ok / closed / already_closed? / hwnd / window / method_requested / method_used / signal / wait / state_after / dialogs / blocked / blocked_reason / degraded / degraded_reason / foreground / timing / detail / allowlist? / allowlist_source? / hints?`。
 
 关键字段：
 
@@ -386,9 +388,9 @@ $env:PYTHONUTF8=1
 | `signal` | 实际发出的关闭信号（`channel` = `wm_close` / `keyboard`、`delivered` = 投递是否成功、`foreground` 核验结果） |
 | `wait` | 轮询收敛明细（`waited_ms` / `polls` / `poll_interval` / `timeout`），替换旧的 0.4 s / 0.6 s 单次判定 |
 | `blocked` / `blocked_reason` / `dialogs` | **C3 模态框阻断**：句柄仍存活且诊断到同进程模态对话框（未保存确认框等）时 `blocked=true`、`blocked_reason="modal_dialog"`，`dialogs[]` 含对话框 `hwnd` / 标题 / 可见文本；**内核不点击、不盲重试**，交上层决策 |
-| `degraded_reason` | `close_fallback_disabled`（键盘通道被硬开关关闭）/ `close_not_confirmed`（超时仍未确认句柄消失）/ `foreground_locked`（alt+f4 回退前前台核验未通过，未发键以避免误关其它窗口） |
+| `degraded_reason` | `close_disabled`（关闭能力总开关 `UIAGENT_CLOSE_ENABLED=0`，整条链路拒绝）/ `close_not_allowlisted`（目标不在生效关闭白名单内）/ `close_fallback_disabled`（键盘通道被硬开关关闭）/ `close_not_confirmed`（超时仍未确认句柄消失）/ `foreground_locked`（alt+f4 回退前前台核验未通过，未发键以避免误关其它窗口） |
 
-行为口径（改动点 C0~C5）：
+行为口径（改动点 C0~C6）：
 
 | 口径 | 内容 |
 | --- | --- |
@@ -398,6 +400,7 @@ $env:PYTHONUTF8=1
 | **C3 模态框阻断** | 检出同进程模态对话框即返回 `blocked` + `dialogs`，交上层决策（超时未消失但无模态 → `degraded_reason="close_not_confirmed"`） |
 | **C4 轮询收敛** | 关闭后按 `poll_interval`（25 ms）轮询至 `timeout`，**替换**改造前"发键 → `sleep(0.4)` 单次判"与"补发 → `sleep(0.6)`"的固定等待 |
 | **C5 回退开关** | `UIAGENT_CLOSE_FALLBACK`（或 `fallback=`）取 `alt_f4`（默认）/ `off`；`off` 是**键盘通道硬开关**——不发任何关闭按键（显式 `method="alt_f4"` 也降级回 `WM_CLOSE` 并标 `degraded_reason="close_fallback_disabled"`）；默认 `alt_f4` 仅在**无模态框**且**前台核验通过**（`GetForegroundWindow()==hwnd`）时补一次 `alt+f4` |
+| **C6 权限闸** | `UIAGENT_CLOSE_ENABLED`（总开关，`0` → `degraded_reason="close_disabled"`）+ `UIAGENT_CLOSE_ALLOWLIST`（白名单：未设置 → 内置默认白名单 `DEFAULT_CLOSE_ALLOWLIST`，仅常用 GUI 应用，**不含** `cmd` / `powershell` / 终端 / `taskmgr` / `regedit`；显式配置以配置为准；显式 `*` / `all` 才解除校验）——**在窗口定位之前**判定：任一不过即 `ok=false` + `method_used="none"`，**不定位、不投递 `WM_CLOSE`、不注入任何按键**，返回体带 `allowlist` / `allowlist_source`（`default` / `env`）/ `hint` 并落审计告警 |
 
 调用约定：
 
@@ -405,6 +408,7 @@ $env:PYTHONUTF8=1
 - 收到 `blocked=true` + `dialogs` 时**不要重试关闭**：应先按对话框语义处置（如保存 / 丢弃），处置完成后再调用一次 `ui_close` 复核句柄。
 - 关闭成功判据只看 `closed`，**不要**用 `ui_app_status` 的 `state` 或 `cached_hwnd` 判定（应用驻留后台时状态仍为 `visible`，属正常，见 §7.1 第四节）。
 - 只给 `app` 时按**应用**解析目标窗口（`notepad.exe` / `记事本` 等别名均可）；应用当前**无窗口**（未运行或已全部关闭）时返回 `ok=false` + `detail="未找到匹配窗口（…）"` + `hints`（含疑似候选与隐藏窗口排查建议）——**属预期语义**，不代表关闭失败，可按 `hints` 用 `ui_window_list(include_invisible=true)` 复核后再决定是否重试。
+- 关闭目标是否放行由 **C6 权限闸**决定（`UIAGENT_CLOSE_ENABLED` / `UIAGENT_CLOSE_ALLOWLIST`，**未配置 env 时默认启用安全白名单**，与启动能力同口径）：被拒时返回 `ok=false` + `degraded_reason="close_disabled"` / `"close_not_allowlisted"`（`method_used="none"`）且**未发送任何关闭信号**——此时**不要**改用 `ui_hotkey` 发 `alt+f4` 绕过，应按 `hint` 调整白名单配置（改后需重启 MCP 服务）或与用户确认后再放开。
 
 ### 4.12 `ui_screenshot`
 
@@ -526,6 +530,11 @@ P2 启动安全闸验证（零进程断言，逐项比对 `tasklist` 前后快�
 | 默认白名单拦截命令解释器 | 不设 `UIAGENT_LAUNCH_ALLOWLIST`，请求 `cmd` | `ok=false`、`degraded_reason=not_allowlisted`、**无进程**（`hint` 给出放开方式） |
 | 显式配置覆盖默认白名单 | `ALLOWLIST=weixin.exe,微信`，请求 `记事本` | `ok=false`、`degraded_reason=not_allowlisted`（默认条目不再放行） |
 | 显式解除限制入口 | `ALLOWLIST=*`，请求 `cmd`（`dry_run=true`） | `ok=true`、`state=dry_run`（不校验，仅解析） |
+| 关闭：默认白名单生效（未配置 env） | 不设 `UIAGENT_CLOSE_ALLOWLIST`，关闭标题含「记事本」的窗口 | `ok=true`、`method_used=wm_close`（`allowlist_source=default`） |
+| 关闭：默认白名单拦截 | 不设 `UIAGENT_CLOSE_ALLOWLIST`，关闭非白名单窗口 | `ok=false`、`degraded_reason=close_not_allowlisted`、**窗口存活**（未投递 `WM_CLOSE`、未发键） |
+| 关闭：开关禁用 + 关闭请求 | `UIAGENT_CLOSE_ENABLED=0` | `ok=false`、`degraded_reason=close_disabled`、`method_used=none`、**窗口存活** |
+| 关闭：显式配置覆盖默认白名单 | `UIAGENT_CLOSE_ALLOWLIST=notepad.exe`，关闭非白名单窗口 | `ok=false`、`close_not_allowlisted`（`allowlist_source=env`）、**窗口存活** |
+| 关闭：显式解除限制入口 | `UIAGENT_CLOSE_ALLOWLIST=*`，关闭非白名单窗口 | `ok=true`、`method_used=wm_close`（不校验） |
 
 退出码：`0` 全部通过，`1` 存在失败检查项。
 
@@ -560,6 +569,7 @@ P2 启动安全闸验证（零进程断言，逐项比对 `tasklist` 前后快�
 | 回退开关（P1） | `UIAGENT_ENSURE_V2=0` 时 `ui_app_ensure` 退回 `find_window` + `activate_window` 旧链路（`fallback="legacy"`）：命中窗口返回 `state="unknown"` 且不判四状态；未命中返回 `state="not_running"` 且无 `candidates`；`timing` 仅 `snapshot_ms` / `total_ms` |
 | 回退开关（P2） | `UIAGENT_LAUNCH_ENABLED=0` 一键禁用启动能力，S4 回到改造前「空白态」（`not_running` + 提示人工启动），其余工具不受影响；`UIAGENT_LAUNCH_ALLOWLIST` 显式配置即覆盖内置默认白名单（需放开默认之外的入口时使用），显式设为 `*` / `all` 即解除白名单限制（不校验） |
 | 回退开关（关闭可靠性根治） | `UIAGENT_CLOSE_FALLBACK=off`（或 `ui_close(fallback="off")`）为**键盘通道硬开关**：`ui_close` 不发任何关闭按键，仅走程序化 `WM_CLOSE` 通道；显式 `method="alt_f4"` 时降级为 `WM_CLOSE` 并标注 `degraded_reason="close_fallback_disabled"`（**绝不空转、不静默失败**）。其余工具（含 `ui_hotkey`）不受该开关影响 |
+| 关闭安全闸（C6 权限闸，关闭能力新增） | ①`UIAGENT_CLOSE_ENABLED=0` → `ui_close` 整条链路拒绝（`degraded_reason="close_disabled"`，`method_used="none"`）；②`UIAGENT_CLOSE_ALLOWLIST` **默认启用安全白名单**（未设置 / 空白 → 内置默认白名单 `DEFAULT_CLOSE_ALLOWLIST`：常用 GUI 应用，不含 `cmd` / `powershell` / 终端 / `taskmgr` / `regedit` 等命令解释器与系统管理工具；显式配置 → 以配置为准；显式设为 `*` / `all` → 不校验）→ 仅放行生效白名单（别名 / 进程名 / 标题关键词，大小写不敏感），其余 `close_not_allowlisted` + 审计告警。两条拒绝路径均在**窗口定位之前**判定，**不投递 `WM_CLOSE`、不注入任何按键**（已用自建独立进程窗口验证「窗口存活」）。改后需重启 MCP 服务生效 |
 
 ### 7.1 输入法与焦点调用约定（新增）
 
@@ -648,6 +658,8 @@ P2 启动安全闸验证（零进程断言，逐项比对 `tasklist` 前后快�
 | `ui_launch_app` 返回多个 `candidates` | 解析歧义（如同名快捷方式），按 RF5 **不会自动启动**；请用 `candidates[].target_path` 指定绝对路径，或先冻结该别名 |
 | `ui_type` 输入的字符与预期不符（吞字 / 串码 / 变成中文） | 中文输入法拦截了纯 ASCII 串的键盘注入（`auto` 对全 ASCII 串走 `typewrite`）：改用 `ui_type(method="clipboard")`，或先切英文输入法后重输；详见 §7.1 |
 | `ui_hotkey("ctrl+s")` 未保存 | 按键落到非目标窗口或未保存对话框阻塞：先 `ui_activate_window` / `ui_app_ensure(require_foreground=true)` 取前台焦点再发键；保存后回读磁盘（内容 / `mtime`）复核（详见 §7.1） |
+| `ui_close` 返回 `ok=false` + `degraded_reason="close_disabled"` | `UIAGENT_CLOSE_ENABLED=0` 已禁用关闭能力（**整条链路拒绝**，含窗口定位）：需关闭能力时把该变量设为 `1` 并重启 MCP 服务 |
+| `ui_close` 返回 `ok=false` + `degraded_reason="close_not_allowlisted"` | 目标不在生效关闭白名单内：未配置 `UIAGENT_CLOSE_ALLOWLIST` 时命中的是**内置默认白名单**（常用 GUI 应用，不含 `cmd` / `powershell` / 终端等命令解释器与系统管理工具），如确实需要关闭该目标，显式配置该变量把别名 / 进程名（逗号分隔）加入；确需完全不校验时显式设为 `*` / `all`；**不要**改用 `ui_hotkey` 发 `alt+f4` 绕过；返回体 `hint` 已标注拒绝来源与放开方式 |
 | `ui_close(app="notepad.exe")` 返回 `ok=false` + `detail="未找到匹配窗口（…）"` | 按 **C0 目标解析**，该应用当前**无窗口**（未运行或已全部关闭），**不是关闭失败**；按返回的 `hints` 用 `ui_window_list(include_invisible=true)` 复核后再决定是否重试（若内核尚未含 C0 修复，`app` 会被误当标题匹配而必然 miss，需升级内核） |
 | `ui_close` 返回 `blocked=true` + `blocked_reason="modal_dialog"` | 目标窗口被**同进程模态对话框**（如未保存确认框）阻塞，句柄因此未消失：`dialogs[]` 已给出对话框 `hwnd` / 标题 / 可见文本——**按对话框语义处置（保存 / 丢弃）后再调一次 `ui_close` 复核**；内核**不会**代为点击，**不要**原地重复关闭 |
 | `ui_close` 返回 `closed=false` + `degraded_reason="close_not_confirmed"` | `timeout` 内句柄仍在且**未发现模态框**（关闭慢于预算或窗口拒绝关闭）：先 `ui_window_list(include_invisible=true)` 按 `hwnd` 复核真实窗口态，仍存活时再调一次并加大 `timeout`，或如实上报交人工 |
